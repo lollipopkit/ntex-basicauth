@@ -1,0 +1,25 @@
+[package]
+name = "ntex-basicauth"
+version = "0.1.0"
+edition = "2024"
+authors = ["lollipopkit <a@lpkt.cn>"]
+description = "A Basic Authentication middleware for ntex web framework."
+license = "MIT"
+repository = "https://github.com/lollipopkit/ntex-basicauth"
+readme = "README.md"
+keywords = ["ntex", "basic-auth", "middleware", "authentication"]
+categories = ["web-programming", "authentication"]
+
+[features]
+default = ["json"]
+json = ["dep:serde", "dep:serde_json"]
+bcrypt = ["dep:bcrypt"]
+
+[dependencies]
+base64 = "0.22"
+dashmap = "6"
+ntex = "2"
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
+bcrypt = { version = "0.15", optional = true }
+thiserror = "1.0"
