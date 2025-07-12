@@ -25,7 +25,7 @@ pub trait UserValidator: Send + Sync {
 
 impl Debug for dyn UserValidator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "UserValidator")
+        f.write_str("UserValidator")
     }
 }
 
@@ -36,12 +36,14 @@ pub struct StaticUserValidator {
 }
 
 impl StaticUserValidator {
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self {
             users: HashMap::new(),
         }
     }
 
+    #[allow(dead_code)]
     pub fn add_user(&mut self, username: String, password: String) -> &mut Self {
         self.users.insert(username, password);
         self
@@ -119,6 +121,7 @@ pub struct BasicAuthConfig {
     pub validator: Arc<dyn UserValidator>,
     pub cache_enabled: bool,
     pub cache_size_limit: usize,
+    pub path_filter: Option<crate::utils::PathFilter>,
 }
 
 impl BasicAuthConfig {
@@ -128,6 +131,7 @@ impl BasicAuthConfig {
             validator,
             cache_enabled: true,
             cache_size_limit: 1000,
+            path_filter: None,
         }
     }
 
@@ -143,6 +147,11 @@ impl BasicAuthConfig {
 
     pub fn cache_size_limit(mut self, limit: usize) -> Self {
         self.cache_size_limit = limit;
+        self
+    }
+
+    pub fn path_filter(mut self, filter: crate::utils::PathFilter) -> Self {
+        self.path_filter = Some(filter);
         self
     }
 }
@@ -214,7 +223,7 @@ impl BasicAuth {
 
     /// Cache authentication result
     fn cache_result(&self, credentials: &Credentials, result: bool) {
-        if let Some(cache) = &self.auth_cache { 
+        if let Some(cache) = &self.auth_cache {
             // Limit cache size to prevent memory exhaustion
             if cache.len() >= self.config.cache_size_limit {
                 cache.clear();
@@ -248,21 +257,23 @@ impl<S> Middleware<S> for BasicAuth {
     fn create(&self, service: S) -> Self::Service {
         BasicAuthMiddlewareService {
             service,
-            config: BasicAuthConfig {
-                realm: self.config.realm.clone(),
-                validator: Arc::clone(&self.config.validator),
-                cache_enabled: self.config.cache_enabled,
-                cache_size_limit: self.config.cache_size_limit,
+            auth: BasicAuth {
+                config: BasicAuthConfig {
+                    realm: self.config.realm.clone(),
+                    validator: Arc::clone(&self.config.validator),
+                    cache_enabled: self.config.cache_enabled,
+                    cache_size_limit: self.config.cache_size_limit,
+                    path_filter: self.config.path_filter.clone(),
+                },
+                auth_cache: self.auth_cache.clone(),
             },
-            auth_cache: self.auth_cache.clone(),
         }
     }
 }
 
 pub struct BasicAuthMiddlewareService<S> {
     service: S,
-    config: BasicAuthConfig,
-    auth_cache: Option<DashMap<String, bool>>,
+    auth: BasicAuth,
 }
 
 impl<S, Err> Service<web::WebRequest<Err>> for BasicAuthMiddlewareService<S>
@@ -278,6 +289,13 @@ where
         req: web::WebRequest<Err>,
         ctx: ServiceCtx<'_, Self>,
     ) -> Result<Self::Response, Self::Error> {
+        // Check if this path should skip authentication
+        if let Some(filter) = &self.auth.config.path_filter {
+            if filter.should_skip(req.path()) {
+                return ctx.call(&self.service, req).await;
+            }
+        }
+
         // Extract Authorization header
         let auth_header = req
             .headers()
@@ -288,26 +306,8 @@ where
         // Parse credentials
         let credentials = BasicAuth::parse_credentials(auth_header)?;
 
-        // Check cache first
-        let is_authenticated = if let Some(cache) = &self.auth_cache {
-            let cache_key = format!("{}:{}", credentials.username, credentials.password);
-            if let Some(cached_result) = cache.get(&cache_key) {
-                *cached_result.value()
-            } else {
-                // Validate with configured validator
-                let result = self.config.validator.validate(&credentials).await?;
-                
-                // Cache the result
-                if cache.len() < self.config.cache_size_limit {
-                    cache.insert(cache_key, result);
-                }
-                
-                result
-            }
-        } else {
-            // No cache, validate directly
-            self.config.validator.validate(&credentials).await?
-        };
+        // Authenticate using BasicAuth methods
+        let is_authenticated = self.auth.authenticate(&credentials).await?;
 
         if !is_authenticated {
             return Err(AuthError::InvalidCredentials.into());
@@ -324,6 +324,29 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    #[ntex::test]
+    async fn test_static_validator() {
+        let mut users = HashMap::new();
+        users.insert("admin".to_string(), "secret".to_string());
+        users.insert("user".to_string(), "password".to_string());
+        
+        let validator = StaticUserValidator::from_map(users);
+        
+        let valid_creds = Credentials {
+            username: "admin".to_string(),
+            password: "secret".to_string(),
+        };
+        
+        let invalid_creds = Credentials {
+            username: "admin".to_string(),
+            password: "wrong".to_string(),
+        };
+        
+        assert!(validator.validate(&valid_creds).await.unwrap());
+        assert!(!validator.validate(&invalid_creds).await.unwrap());
+    }
 
     #[test]
     fn test_parse_credentials() {
@@ -340,5 +363,25 @@ mod tests {
         assert!(BasicAuth::parse_credentials("Bearer token").is_err());
         assert!(BasicAuth::parse_credentials("Basic invalid-base64").is_err());
         assert!(BasicAuth::parse_credentials("Basic bm90Y29sb24=").is_err()); // "notcolon"
+    }
+
+    #[cfg(feature = "bcrypt")]
+    #[ntex::test]
+    async fn test_bcrypt_validator() {
+        let mut validator = BcryptUserValidator::new();
+        validator.add_user_with_password("admin".to_string(), "secret").unwrap();
+        
+        let valid_creds = Credentials {
+            username: "admin".to_string(),
+            password: "secret".to_string(),
+        };
+        
+        let invalid_creds = Credentials {
+            username: "admin".to_string(),
+            password: "wrong".to_string(),
+        };
+        
+        assert!(validator.validate(&valid_creds).await.unwrap());
+        assert!(!validator.validate(&invalid_creds).await.unwrap());
     }
 }
