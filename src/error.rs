@@ -29,12 +29,9 @@ struct AuthErrorResponse {
     error: String,
 }
 
-impl web::error::WebResponseError for AuthError {
-    fn status_code(&self) -> StatusCode {
-        StatusCode::UNAUTHORIZED
-    }
-
-    fn error_response(&self, _req: &ntex::web::HttpRequest) -> web::HttpResponse {
+impl AuthError {
+    /// Create HTTP 401 response with proper WWW-Authenticate header
+    pub fn to_response(&self, realm: &str) -> web::HttpResponse {
         let error_response = AuthErrorResponse {
             code: 401,
             message: "Authentication required".to_string(),
@@ -51,9 +48,21 @@ impl web::error::WebResponseError for AuthError {
             self
         );
 
-        web::HttpResponse::build(self.status_code())
+        let www_authenticate = format!("Basic realm=\"{}\"", realm);
+
+        web::HttpResponse::build(StatusCode::UNAUTHORIZED)
             .set_header("content-type", "application/json")
-            .set_header("www-authenticate", "Basic realm=\"Restricted Area\"")
+            .set_header("www-authenticate", www_authenticate)
             .body(body)
+    }
+}
+
+impl web::error::WebResponseError for AuthError {
+    fn status_code(&self) -> StatusCode {
+        StatusCode::UNAUTHORIZED
+    }
+
+    fn error_response(&self, _req: &ntex::web::HttpRequest) -> web::HttpResponse {
+        self.to_response("Restricted Area")
     }
 }

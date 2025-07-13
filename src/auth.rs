@@ -1,7 +1,7 @@
 use crate::error::{AuthError, AuthResult};
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use dashmap::DashMap;
-use ntex::{web, Middleware, Service, ServiceCtx};
+use ntex::{Middleware, Service, ServiceCtx, web};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future::Future;
@@ -88,7 +88,11 @@ impl BcryptUserValidator {
         self
     }
 
-    pub fn add_user_with_password(&mut self, username: String, password: &str) -> AuthResult<&mut Self> {
+    pub fn add_user_with_password(
+        &mut self,
+        username: String,
+        password: &str,
+    ) -> AuthResult<&mut Self> {
         let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST)
             .map_err(|e| AuthError::ValidationFailed(format!("BCrypt hash failed: {}", e)))?;
         self.users.insert(username, hash);
@@ -105,8 +109,9 @@ impl UserValidator for BcryptUserValidator {
         Box::pin(async move {
             match self.users.get(&credentials.username) {
                 Some(stored_hash) => {
-                    bcrypt::verify(&credentials.password, stored_hash)
-                        .map_err(|e| AuthError::ValidationFailed(format!("BCrypt verify failed: {}", e)))
+                    bcrypt::verify(&credentials.password, stored_hash).map_err(|e| {
+                        AuthError::ValidationFailed(format!("BCrypt verify failed: {}", e))
+                    })
                 }
                 None => Ok(false),
             }
@@ -199,8 +204,7 @@ impl BasicAuth {
             .decode(encoded)
             .map_err(|_| AuthError::InvalidBase64)?;
 
-        let decoded_str = String::from_utf8(decoded)
-            .map_err(|_| AuthError::InvalidBase64)?;
+        let decoded_str = String::from_utf8(decoded).map_err(|_| AuthError::InvalidBase64)?;
 
         let parts: Vec<&str> = decoded_str.splitn(2, ':').collect();
         if parts.len() != 2 {
@@ -228,7 +232,7 @@ impl BasicAuth {
             if cache.len() >= self.config.cache_size_limit {
                 cache.clear();
             }
-            
+
             let cache_key = format!("{}:{}", credentials.username, credentials.password);
             cache.insert(cache_key, result);
         }
@@ -243,10 +247,10 @@ impl BasicAuth {
 
         // Validate with configured validator
         let result = self.config.validator.validate(credentials).await?;
-        
+
         // Cache the result
         self.cache_result(credentials, result);
-        
+
         Ok(result)
     }
 }
@@ -300,17 +304,38 @@ where
         let auth_header = req
             .headers()
             .get("authorization")
-            .and_then(|h| h.to_str().ok())
-            .ok_or(AuthError::MissingHeader)?;
+            .and_then(|h| h.to_str().ok());
+
+        // Handle missing authorization header
+        let auth_header = match auth_header {
+            Some(header) => header,
+            None => {
+                let response = AuthError::MissingHeader.to_response(&self.auth.config.realm);
+                return Ok(req.into_response(response));
+            }
+        };
 
         // Parse credentials
-        let credentials = BasicAuth::parse_credentials(auth_header)?;
+        let credentials = match BasicAuth::parse_credentials(auth_header) {
+            Ok(creds) => creds,
+            Err(err) => {
+                let response = err.to_response(&self.auth.config.realm);
+                return Ok(req.into_response(response));
+            }
+        };
 
         // Authenticate using BasicAuth methods
-        let is_authenticated = self.auth.authenticate(&credentials).await?;
+        let is_authenticated = match self.auth.authenticate(&credentials).await {
+            Ok(result) => result,
+            Err(err) => {
+                let response = err.to_response(&self.auth.config.realm);
+                return Ok(req.into_response(response));
+            }
+        };
 
         if !is_authenticated {
-            return Err(AuthError::InvalidCredentials.into());
+            let response = AuthError::InvalidCredentials.to_response(&self.auth.config.realm);
+            return Ok(req.into_response(response));
         }
 
         // Add credentials to request extensions for downstream access
@@ -331,19 +356,19 @@ mod tests {
         let mut users = HashMap::new();
         users.insert("admin".to_string(), "secret".to_string());
         users.insert("user".to_string(), "password".to_string());
-        
+
         let validator = StaticUserValidator::from_map(users);
-        
+
         let valid_creds = Credentials {
             username: "admin".to_string(),
             password: "secret".to_string(),
         };
-        
+
         let invalid_creds = Credentials {
             username: "admin".to_string(),
             password: "wrong".to_string(),
         };
-        
+
         assert!(validator.validate(&valid_creds).await.unwrap());
         assert!(!validator.validate(&invalid_creds).await.unwrap());
     }
@@ -353,7 +378,7 @@ mod tests {
         // "admin:secret" base64 encoded
         let auth_header = "Basic YWRtaW46c2VjcmV0";
         let creds = BasicAuth::parse_credentials(auth_header).unwrap();
-        
+
         assert_eq!(creds.username, "admin");
         assert_eq!(creds.password, "secret");
     }
@@ -369,18 +394,20 @@ mod tests {
     #[ntex::test]
     async fn test_bcrypt_validator() {
         let mut validator = BcryptUserValidator::new();
-        validator.add_user_with_password("admin".to_string(), "secret").unwrap();
-        
+        validator
+            .add_user_with_password("admin".to_string(), "secret")
+            .unwrap();
+
         let valid_creds = Credentials {
             username: "admin".to_string(),
             password: "secret".to_string(),
         };
-        
+
         let invalid_creds = Credentials {
             username: "admin".to_string(),
             password: "wrong".to_string(),
         };
-        
+
         assert!(validator.validate(&valid_creds).await.unwrap());
         assert!(!validator.validate(&invalid_creds).await.unwrap());
     }
