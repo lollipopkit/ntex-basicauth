@@ -9,14 +9,13 @@ A Basic Authentication middleware designed for the [ntex](https://github.com/nte
 
 ## Features
 
-- 🔐 **Basic Authentication** - Standard HTTP Basic Authentication support
-- 🏗️ **Builder** - Simple API design
-- ⚡ **Cache** - Built-in authentication result cache to reduce validation overhead
-- 🔧 **Flexible Configuration** - Supports multiple user validation methods
-- 🛣️ **Path Filtering** - Supports skipping authentication for specific paths
-- 🔒 **BCrypt Support** - Optional BCrypt password hashing (requires `bcrypt` feature)
-- 📄 **JSON Response** - Optional JSON error response (requires `json` feature)
-- 🎯 **Custom Validator** - Support for custom user validation logic
+- **Cache** - Built-in authentication result cache to reduce validation overhead
+- **Flexible Configuration** - Supports multiple user validation methods
+- **Path Filtering** - Supports skipping authentication for specific paths
+- **BCrypt Support** - Optional BCrypt password hashing (requires `bcrypt` feature)
+- **JSON Response** - Optional JSON error response (requires `json` feature)
+- **Custom Validator** - Support for custom user validation logic
+- **Regex Paths** - Regular expression path matching (requires `regex` feature)
 
 ## Installation
 
@@ -24,12 +23,12 @@ Add the dependency in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ntex-basicauth = "0.1"
+ntex-basicauth = "^0"
 ```
 
 ```toml
 [dependencies]
-ntex-basicauth = { version = "0.1", features = ["bcrypt"] }
+ntex-basicauth = { version = "^0", features = ["bcrypt"] }
 ```
 
 ## Quick Start
@@ -62,7 +61,7 @@ async fn main() -> std::io::Result<()> {
 async fn protected_handler() -> &'static str {
     "This is protected content!"
 }
--
+
 async fn public_handler() -> &'static str {
     "This is public content"
 }
@@ -72,17 +71,20 @@ async fn public_handler() -> &'static str {
 
 ```rust
 use ntex_basicauth::{BasicAuthBuilder, PathFilter};
+use std::time::Duration;
 
 let auth = BasicAuthBuilder::new()
     .user("admin", "secret")
     .user("user", "password")
     .realm("My Application")
+    .cache_ttl(Duration::from_secs(300)) // 5 minutes cache
     .cache_size_limit(500)
     .path_filter(
         PathFilter::new()
             .skip_prefix("/public/")
             .skip_exact("/health")
             .skip_suffix(".css")
+            .skip_regex(r"^/assets/.*\.(js|css|png|jpg)$") // requires regex feature
     )
     .build()
     .unwrap();
@@ -97,52 +99,41 @@ web::App::new()
 After enabling the `bcrypt` feature:
 
 ```rust
-use ntex_basicauth::{BasicAuthConfig, BcryptUserValidator};
-use std::sync::Arc;
+use ntex_basicauth::{BasicAuthBuilder, BcryptUserValidator};
 
-let mut validator = BcryptUserValidator::new();
-validator.add_user_with_password("admin".to_string(), "secret").unwrap();
-
-let config = BasicAuthConfig::new(Arc::new(validator))
-    .realm("Secure Area".to_string());
-
-let auth = BasicAuth::new(config);
+let auth = BasicAuthBuilder::new()
+    .bcrypt_user("admin", "$2b$12$...") // BCrypt hash
+    .bcrypt_user_with_password("user", "password") // Will hash automatically
+    .build()
+    .unwrap();
 ```
 
 ### Custom Validator
 
 ```rust
-use ntex_basicauth::{UserValidator, Credentials, AuthResult, BasicAuthConfig, BasicAuth};
+use ntex_basicauth::{UserValidator, Credentials, AuthResult, BasicAuthBuilder};
 use std::sync::Arc;
-use std::pin::Pin;
-use std::future::Future;
 
 struct DatabaseValidator {
-    // Database connection, etc.
+    // Database connection pool, etc.
 }
 
 impl UserValidator for DatabaseValidator {
-    fn validate<'a>(
-        &'a self,
-        credentials: &'a Credentials,
-    ) -> Pin<Box<dyn Future<Output = AuthResult<bool>> + Send + 'a>> {
-        Box::pin(async move {
-            // Implement database query logic here
-            // For example: check if username and password match in the database
-            let user_exists = check_user_in_database(&credentials.username, &credentials.password).await;
-            Ok(user_exists)
-        })
+    async fn validate(&self, credentials: &Credentials) -> AuthResult<bool> {
+        // Query database
+        let user_exists = check_user_in_database(
+            &credentials.username, 
+            &credentials.password
+        ).await;
+        Ok(user_exists)
     }
 }
 
-async fn check_user_in_database(username: &str, password: &str) -> bool {
-    // Actual database query logic
-    true // Example return value
-}
-
 // Using custom validator
-let config = BasicAuthConfig::new(Arc::new(DatabaseValidator {}));
-let auth = BasicAuth::new(config);
+let auth = BasicAuthBuilder::new()
+    .validator(Arc::new(DatabaseValidator {}))
+    .build()
+    .unwrap();
 ```
 
 ## Getting User Information
@@ -166,7 +157,7 @@ async fn handler(req: web::HttpRequest) -> web::Result<String> {
 
     // Check if specific user
     if is_user(&req, "admin") {
-        return Ok("Admin user".to_string());
+        return Ok("Admin access granted".to_string());
     }
 
     Ok("Unknown user".to_string())
@@ -221,20 +212,15 @@ Error types:
 Authentication cache is enabled by default, which can significantly reduce repeated validation overhead:
 
 ```rust
-let config = BasicAuthConfig::new(validator)
-    .cache_size_limit(500)  // Set cache entry limit
-    .disable_cache();       // Or completely disable cache
-```
+use std::time::Duration;
 
-### Path Filtering
-
-For paths that do not require authentication, use path filter to skip authentication check:
-
-```rust
-let filter = PathFilter::new()
-    .skip_prefix("/static/")    // Static resources
-    .skip_exact("/health")      // Health check
-    .skip_suffix(".ico");       // Icon files
+let auth = BasicAuthBuilder::new()
+    .users(users)
+    .cache_ttl(Duration::from_secs(600))    // 10 minutes
+    .cache_size_limit(1000)                 // Max 1000 entries
+    .cache_cleanup_interval(Duration::from_secs(300)) // Cleanup every 5 min
+    .build()
+    .unwrap();
 ```
 
 ## License

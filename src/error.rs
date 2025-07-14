@@ -17,6 +17,10 @@ pub enum AuthError {
     InvalidCredentials,
     #[error("User validation failed: {0}")]
     ValidationFailed(String),
+    #[error("Cache operation failed: {0}")]
+    CacheError(String),
+    #[error("Configuration error: {0}")]
+    ConfigError(String),
 }
 
 pub type AuthResult<T> = Result<T, AuthError>;
@@ -27,15 +31,23 @@ struct AuthErrorResponse {
     code: u32,
     message: String,
     error: String,
+    #[cfg_attr(feature = "json", serde(skip_serializing_if = "Option::is_none"))]
+    details: Option<String>,
 }
 
 impl AuthError {
     /// Create HTTP 401 response with proper WWW-Authenticate header
     pub fn to_response(&self, realm: &str) -> web::HttpResponse {
+        self.to_response_with_details(realm, None)
+    }
+
+    /// Create HTTP 401 response with custom details
+    pub fn to_response_with_details(&self, realm: &str, details: Option<String>) -> web::HttpResponse {
         let error_response = AuthErrorResponse {
             code: 401,
             message: "Authentication required".to_string(),
             error: self.to_string(),
+            details,
         };
 
         #[cfg(feature = "json")]
