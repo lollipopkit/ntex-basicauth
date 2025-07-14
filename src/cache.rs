@@ -1,10 +1,10 @@
 //! Auth cache implementation with TTL and size management
 
 use dashmap::DashMap;
+use ntex::time::interval;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::time::{Duration, interval};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::{AuthError, AuthResult};
 
@@ -168,12 +168,11 @@ impl CacheConfig {
 }
 
 /// Auth cache with TTL and auto cleanup
-#[derive(Debug)]
 pub struct AuthCache {
     cache: Arc<DashMap<String, CacheEntry>>,
     config: CacheConfig,
     stats: CacheStatistics,
-    _cleanup_handle: Option<tokio::task::JoinHandle<()>>,
+    _cleanup_handle: Option<ntex::rt::JoinHandle<()>>,
 }
 
 impl AuthCache {
@@ -207,9 +206,9 @@ impl AuthCache {
         cache: Arc<DashMap<String, CacheEntry>>,
         config: CacheConfig,
         stats: CacheStatistics,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            let mut interval = interval(Duration::from_secs(config.cleanup_interval_seconds));
+    ) -> ntex::rt::JoinHandle<()> {
+        ntex::rt::spawn(async move {
+            let interval = interval(Duration::from_secs(config.cleanup_interval_seconds));
 
             loop {
                 interval.tick().await;
@@ -234,7 +233,7 @@ impl AuthCache {
 
         if let Some(mut entry) = self.cache.get_mut(key) {
             if entry.is_expired() {
-                drop(entry); // 释放读锁
+                drop(entry); // Release the lock before removing
                 self.cache.remove(key);
                 self.stats.add_miss();
                 None
@@ -252,7 +251,7 @@ impl AuthCache {
 
     /// Insert value into cache
     pub fn insert(&self, key: String, value: bool) -> AuthResult<()> {
-        // 检查大小限制
+        // Check the size limit before insertion
         if self.cache.len() >= self.config.max_size {
             self.force_cleanup();
         }
@@ -276,21 +275,21 @@ impl AuthCache {
         let expired_count = Self::cleanup_expired(&self.cache);
         self.stats.add_expired_cleaned(expired_count);
 
-        // 如果仍然太大，按热度清理
+        // If size exceeds max_size, clean up by hotness
         if self.cache.len() > self.config.max_size {
             let cleaned = Self::cleanup_by_hotness(&self.cache, self.config.cleanup_batch_size);
             self.stats.add_size_cleaned(cleaned);
         }
     }
 
-    /// 清空所有条目
+    /// Clear the entire cache
     pub fn clear(&self) {
         let count = self.cache.len();
         self.cache.clear();
         self.stats.add_cleared(count);
     }
 
-    /// 获取缓存统计信息
+    /// Get cache statistics
     pub fn stats(&self) -> CacheStats {
         let total_entries = self.cache.len() as u64;
         let expired_count = self.cache.iter().filter(|entry| entry.is_expired()).count() as u64;
@@ -329,49 +328,49 @@ impl AuthCache {
         }
     }
 
-    /// 检查缓存是否包含键（不检查过期）
+    /// Check if the cache contains a key
     pub fn contains_key(&self, key: &str) -> bool {
         self.cache.contains_key(key)
     }
 
-    /// 获取当前缓存大小
+    /// Get the number of entries in the cache
     pub fn len(&self) -> usize {
         self.cache.len()
     }
 
-    /// 检查缓存是否为空
+    /// Check if the cache is empty
     pub fn is_empty(&self) -> bool {
         self.cache.is_empty()
     }
 
-    /// 获取缓存配置
+    /// Get the cache configuration
     pub fn config(&self) -> &CacheConfig {
         &self.config
     }
 
-    /// 清理过期条目
+    /// Cleanup expired entries
     fn cleanup_expired(cache: &DashMap<String, CacheEntry>) -> u64 {
         let initial_len = cache.len();
         cache.retain(|_, entry| !entry.is_expired());
         (initial_len - cache.len()) as u64
     }
 
-    /// 基于热度清理条目（移除最冷的条目）
+    /// Cleanup by hotness score
     fn cleanup_by_hotness(cache: &DashMap<String, CacheEntry>, max_remove: usize) -> u64 {
         if cache.len() == 0 {
             return 0;
         }
 
-        // 收集条目及其热度分数
+        // Collect entries and their hotness scores
         let mut entries: Vec<(String, f64)> = cache
             .iter()
             .map(|item| (item.key().clone(), item.value().hotness_score()))
             .collect();
 
-        // 按热度排序（最冷的在前）
+        // Sort by hotness score (ascending)
         entries.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // 移除最冷的条目
+        // Remove the least hot entries
         let remove_count = max_remove.min(entries.len());
         let mut removed = 0;
 
@@ -382,14 +381,6 @@ impl AuthCache {
         }
 
         removed
-    }
-}
-
-impl Drop for AuthCache {
-    fn drop(&mut self) {
-        if let Some(handle) = self._cleanup_handle.take() {
-            handle.abort();
-        }
     }
 }
 
@@ -459,7 +450,7 @@ impl CacheStats {
     }
 }
 
-/// 内部统计追踪
+/// Internal cache statistics structure
 #[derive(Debug, Clone)]
 struct CacheStatistics {
     hit_count: Arc<AtomicU64>,
@@ -517,7 +508,7 @@ impl CacheStatistics {
     }
 }
 
-/// 获取当前时间戳
+/// Get the current timestamp in seconds since UNIX epoch
 fn current_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -538,7 +529,7 @@ mod tests {
         assert_eq!(entry.access_count, 1);
     }
 
-    #[tokio::test]
+    #[ntex::test]
     async fn test_cache_basic_operations() {
         let config = CacheConfig::new().max_size(100).ttl_seconds(60);
         let cache = AuthCache::new(config).unwrap();

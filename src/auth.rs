@@ -265,12 +265,12 @@ impl UserValidator for BcryptUserValidator {
         Box::pin(async move {
             match self.users.get(&credentials.username) {
                 Some(stored_hash) => {
-                    // BCrypt验证是CPU密集型操作，在阻塞任务中运行
+                    // Bcrypt verification is blocking, so we use spawn_blocking
                     let password = credentials.password.clone();
                     let hash = stored_hash.clone();
 
                     let result =
-                        tokio::task::spawn_blocking(move || bcrypt::verify(&password, &hash)).await;
+                        ntex::rt::spawn_blocking(move || bcrypt::verify(&password, &hash)).await;
 
                     match result {
                         Ok(Ok(is_valid)) => Ok(is_valid),
@@ -678,10 +678,10 @@ mod tests {
         let key1 = creds.cache_key();
         let key2 = creds.cache_key();
 
-        // 相同凭据应产生相同的键
+        // The same credentials should produce the same cache key
         assert_eq!(key1, key2);
 
-        // 键不应包含明文密码
+        // Cache key should not contain sensitive information
         assert!(!key1.contains("secret"));
         assert!(!key1.contains("admin"));
     }

@@ -221,9 +221,6 @@ pub fn lib_info() -> LibInfo {
     #[cfg(feature = "bcrypt")]
     features.push("bcrypt");
 
-    #[cfg(feature = "tokio")]
-    features.push("tokio");
-
     LibInfo {
         version: VERSION,
         name: env!("CARGO_PKG_NAME"),
@@ -272,7 +269,7 @@ mod tests {
     #[tokio::test]
     async fn test_bcrypt_auth() {
         let mut users = HashMap::new();
-        // 这是 "secret" 的 BCrypt hash
+        // This is a sample BCrypt hash for the password "secret"
         users.insert(
             "admin".to_string(),
             "$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewdBPj6QJEo4m7HS".to_string(),
@@ -297,22 +294,20 @@ mod tests {
     fn test_lib_info_features() {
         let info = lib_info();
 
-        // 检查默认特性是否启用
+        // Check if all expected features are enabled
         assert!(info.enabled_features.contains(&"json"));
         assert!(info.enabled_features.contains(&"cache"));
         assert!(info.enabled_features.contains(&"regex"));
         assert!(info.enabled_features.contains(&"timing-safe"));
-        assert!(info.enabled_features.contains(&"tokio"));
 
-        // 打印特性信息以便调试
-        println!("启用的特性: {:?}", info.enabled_features);
+        println!("Enabled features: {:?}", info.enabled_features);
     }
 
     #[test]
     fn test_prelude_imports() {
         use crate::prelude::*;
 
-        // 测试预导入模块是否正常工作
+        // Check if prelude imports work correctly
         let _builder = BasicAuthBuilder::new();
         let _filter = PathFilter::new();
         let _error = AuthError::MissingHeader;
