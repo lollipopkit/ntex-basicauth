@@ -1,4 +1,3 @@
-
 # ntex-basicauth
 
 A Basic Authentication middleware designed for the [ntex](https://github.com/ntex-rs/ntex) web framework.
@@ -16,6 +15,7 @@ A Basic Authentication middleware designed for the [ntex](https://github.com/nte
 - **JSON Response** - Optional JSON error response (requires `json` feature)
 - **Custom Validator** - Support for custom user validation logic
 - **Regex Paths** - Regular expression path matching (requires `regex` feature)
+- **Timing-safe** - Timing-safe password comparison (enabled by default)
 
 ## Installation
 
@@ -26,9 +26,11 @@ Add the dependency in your `Cargo.toml`:
 ntex-basicauth = "^0"
 ```
 
+Enable optional features if needed:
+
 ```toml
 [dependencies]
-ntex-basicauth = { version = "^0", features = ["bcrypt"] }
+ntex-basicauth = { version = "^0", features = ["bcrypt", "regex"] }
 ```
 
 ## Quick Start
@@ -37,19 +39,25 @@ ntex-basicauth = { version = "^0", features = ["bcrypt"] }
 
 ```rust
 use ntex::web;
-use ntex_basicauth::BasicAuth;
+use ntex_basicauth::BasicAuthBuilder;
 use std::collections::HashMap;
 
 #[ntex::main]
 async fn main() -> std::io::Result<()> {
-    // Create user list
-    let mut users = HashMap::new();
-    users.insert("admin".to_string(), "secret".to_string());
-    users.insert("user".to_string(), "password".to_string());
 
     web::HttpServer::new(move || {
+        let mut users = HashMap::new();
+        users.insert("admin".to_string(), "secret".to_string());
+        users.insert("user".to_string(), "password".to_string());
+
+        let auth = BasicAuthBuilder::new()
+            .users(users)
+            .realm("My Application")
+            .build()
+            .expect("Failed to configure authentication");
+
         web::App::new()
-            .wrap(BasicAuth::with_users(users.clone()))
+            .wrap(auth)
             .route("/protected", web::get().to(protected_handler))
             .route("/public", web::get().to(public_handler))
     })
@@ -71,39 +79,67 @@ async fn public_handler() -> &'static str {
 
 ```rust
 use ntex_basicauth::{BasicAuthBuilder, PathFilter};
-use std::time::Duration;
+use std::collections::HashMap;
+
+let mut users = HashMap::new();
+users.insert("admin".to_string(), "secret".to_string());
+
+let filter = PathFilter::new()
+    .skip_prefix("/public/")
+    .skip_exact("/health")
+    .skip_suffix(".css");
+
+let auth = BasicAuthBuilder::new()
+    .users(users)
+    .realm("My Application")
+    .path_filter(filter)
+    .log_failures(true)
+    .max_header_size(4096)
+    .build()
+    .unwrap();
+```
+
+### Regex Path Filtering
+
+Enable the `regex` feature in Cargo.toml:
+
+```toml
+[dependencies]
+ntex-basicauth = { version = "^0", features = ["regex"] }
+```
+
+```rust
+use ntex_basicauth::{BasicAuthBuilder, PathFilter};
+
+let filter = PathFilter::new()
+    .skip_regex(r"^/assets/.*\.(js|css|png|jpg)$").unwrap();
 
 let auth = BasicAuthBuilder::new()
     .user("admin", "secret")
-    .user("user", "password")
-    .realm("My Application")
-    .cache_ttl(Duration::from_secs(300)) // 5 minutes cache
-    .cache_size_limit(500)
-    .path_filter(
-        PathFilter::new()
-            .skip_prefix("/public/")
-            .skip_exact("/health")
-            .skip_suffix(".css")
-            .skip_regex(r"^/assets/.*\.(js|css|png|jpg)$") // requires regex feature
-    )
+    .path_filter(filter)
     .build()
     .unwrap();
-
-web::App::new()
-    .wrap(auth)
-    .service(web::resource("/api/data").to(handler))
 ```
 
 ### BCrypt Password Support
 
-After enabling the `bcrypt` feature:
+Enable the `bcrypt` feature in Cargo.toml:
+
+```toml
+[dependencies]
+ntex-basicauth = { version = "^0", features = ["bcrypt"] }
+```
 
 ```rust
 use ntex_basicauth::{BasicAuthBuilder, BcryptUserValidator};
+use std::sync::Arc;
+
+let mut validator = BcryptUserValidator::new();
+validator.add_user_with_password("admin".to_string(), "secret").unwrap();
 
 let auth = BasicAuthBuilder::new()
-    .bcrypt_user("admin", "$2b$12$...") // BCrypt hash
-    .bcrypt_user_with_password("user", "password") // Will hash automatically
+    .validator(Arc::new(validator))
+    .realm("My Application")
     .build()
     .unwrap();
 ```
@@ -113,25 +149,26 @@ let auth = BasicAuthBuilder::new()
 ```rust
 use ntex_basicauth::{UserValidator, Credentials, AuthResult, BasicAuthBuilder};
 use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
 
-struct DatabaseValidator {
-    // Database connection pool, etc.
-}
+struct DatabaseValidator;
 
 impl UserValidator for DatabaseValidator {
-    async fn validate(&self, credentials: &Credentials) -> AuthResult<bool> {
-        // Query database
-        let user_exists = check_user_in_database(
-            &credentials.username, 
-            &credentials.password
-        ).await;
-        Ok(user_exists)
+    fn validate<'a>(
+        &'a self,
+        credentials: &'a Credentials,
+    ) -> Pin<Box<dyn Future<Output = AuthResult<bool>> + Send + 'a>> {
+        Box::pin(async move {
+            // Replace with your DB logic
+            Ok(credentials.username == "admin" && credentials.password == "secret")
+        })
     }
 }
 
-// Using custom validator
 let auth = BasicAuthBuilder::new()
-    .validator(Arc::new(DatabaseValidator {}))
+    .validator(Arc::new(DatabaseValidator))
+    .realm("Custom Realm")
     .build()
     .unwrap();
 ```
@@ -145,17 +182,14 @@ use ntex::web;
 use ntex_basicauth::{extract_credentials, get_username, is_user};
 
 async fn handler(req: web::HttpRequest) -> web::Result<String> {
-    // Get full authentication info
     if let Some(credentials) = extract_credentials(&req) {
         return Ok(format!("User: {}", credentials.username));
     }
 
-    // Get only the username
     if let Some(username) = get_username(&req) {
         return Ok(format!("Welcome, {}!", username));
     }
 
-    // Check if specific user
     if is_user(&req, "admin") {
         return Ok("Admin access granted".to_string());
     }
@@ -164,25 +198,32 @@ async fn handler(req: web::HttpRequest) -> web::Result<String> {
 }
 ```
 
-## Configuration Options
+## PathFilter Macro
 
-### BasicAuthConfig
+You can use the `path_filter!` macro for convenient filter creation:
 
 ```rust
-let config = BasicAuthConfig::new(validator)
-    .realm("My Application".to_string())           // Set authentication realm
-    .disable_cache()                               // Disable cache
-    .cache_size_limit(1000)                        // Set cache size limit
-    .path_filter(filter);                          // Set path filter
+use ntex_basicauth::path_filter;
+
+let filter = path_filter!(
+    exact: ["/health", "/metrics"],
+    prefix: ["/public/"],
+    suffix: [".css", ".js"]
+);
 ```
 
-### PathFilter
+## Common Skip Paths
+
+Use built-in common skip paths:
 
 ```rust
-let filter = PathFilter::new()
-    .skip_exact("/health")          // Skip exact path
-    .skip_prefix("/public/")        // Skip prefix match
-    .skip_suffix(".css");           // Skip suffix match
+use ntex_basicauth::{BasicAuthBuilder, common_skip_paths};
+
+let auth = BasicAuthBuilder::new()
+    .user("admin", "secret")
+    .path_filter(common_skip_paths())
+    .build()
+    .unwrap();
 ```
 
 ## Error Handling
@@ -197,7 +238,7 @@ When authentication fails, the middleware returns HTTP 401 status code and corre
 }
 ```
 
-Error types:
+Error types include:
 
 - `MissingHeader` - Missing Authorization header
 - `InvalidFormat` - Invalid Authorization header format
@@ -205,20 +246,21 @@ Error types:
 - `InvalidCredentials` - Invalid user credentials
 - `ValidationFailed` - User validation failed
 
-## Performance Optimization
+## Cache Configuration
 
-### Cache
-
-Authentication cache is enabled by default, which can significantly reduce repeated validation overhead:
+Cache is enabled by default (unless disabled via builder/config):
 
 ```rust
-use std::time::Duration;
+use ntex_basicauth::{BasicAuthBuilder, CacheConfig};
+
+let cache_config = CacheConfig::new()
+    .max_size(1000)
+    .ttl_minutes(10)
+    .cleanup_interval_seconds(300);
 
 let auth = BasicAuthBuilder::new()
-    .users(users)
-    .cache_ttl(Duration::from_secs(600))    // 10 minutes
-    .cache_size_limit(1000)                 // Max 1000 entries
-    .cache_cleanup_interval(Duration::from_secs(300)) // Cleanup every 5 min
+    .user("admin", "secret")
+    .with_cache(cache_config)
     .build()
     .unwrap();
 ```
