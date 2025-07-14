@@ -1,4 +1,9 @@
-use crate::error::{AuthError, AuthResult};
+//! Core implementation of basic authentication
+
+use crate::{
+    error::{AuthError, AuthResult},
+    is_valid_username,
+};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use ntex::{Middleware, Service, ServiceCtx, web};
 use std::collections::HashMap;
@@ -7,22 +12,31 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+#[cfg(feature = "timing-safe")]
+use subtle::ConstantTimeEq;
+
 #[cfg(feature = "cache")]
 use {
-    dashmap::DashMap,
-    sha2::{Sha256, Digest},
-    std::time::{SystemTime, UNIX_EPOCH},
+    crate::cache::{AuthCache, CacheConfig},
+    sha2::{Digest, Sha256},
 };
 
 /// User credentials
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Credentials {
+    /// Username
     pub username: String,
+    /// Password
     pub password: String,
 }
 
 impl Credentials {
-    /// Generate secure cache key using SHA256 hash
+    /// Create new credentials instance
+    pub fn new(username: String, password: String) -> Self {
+        Self { username, password }
+    }
+
+    /// Generate secure cache key (using SHA256 hash)
     #[cfg(feature = "cache")]
     pub fn cache_key(&self) -> String {
         let mut hasher = Sha256::new();
@@ -31,41 +45,56 @@ impl Credentials {
         hasher.update(self.password.as_bytes());
         format!("{:x}", hasher.finalize())
     }
-    
-    /// Constant-time password comparison to prevent timing attacks
+
+    /// Timing-safe password verification to prevent timing attacks
     #[cfg(feature = "timing-safe")]
     pub fn verify_password(&self, expected: &str) -> bool {
-        self.constant_time_eq(&self.password, expected)
+        self.password.as_bytes().ct_eq(expected.as_bytes()).into()
     }
-    
-    #[cfg(feature = "timing-safe")]
-    fn constant_time_eq(&self, a: &str, b: &str) -> bool {
-        let a_bytes = a.as_bytes();
-        let b_bytes = b.as_bytes();
-        
-        if a_bytes.len() != b_bytes.len() {
-            return false;
-        }
-        
-        let mut result = 0u8;
-        for i in 0..a_bytes.len() {
-            result |= a_bytes[i] ^ b_bytes[i];
-        }
-        result == 0
+
+    /// Non-timing-safe password verification (fallback if timing-safe feature is off)
+    #[cfg(not(feature = "timing-safe"))]
+    pub fn verify_password(&self, expected: &str) -> bool {
+        self.password == expected
+    }
+
+    /// Get username reference (avoid clone)
+    pub fn username_ref(&self) -> &str {
+        &self.username
+    }
+
+    /// Validate credentials format
+    pub fn is_valid_format(&self) -> bool {
+        is_valid_username(&self.username)
+            && !self.password.contains('\n')
+            && !self.password.contains('\r')
     }
 }
 
-/// User validation trait for custom authentication logic
-pub trait UserValidator: Send + Sync {
+/// User validator trait for custom authentication logic
+pub trait UserValidator: Send + Sync + Debug {
+    /// Validate user credentials
     fn validate<'a>(
         &'a self,
         credentials: &'a Credentials,
     ) -> Pin<Box<dyn Future<Output = AuthResult<bool>> + Send + 'a>>;
-}
 
-impl Debug for dyn UserValidator {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("UserValidator")
+    /// Get validator name (for logging)
+    fn name(&self) -> &'static str {
+        "UserValidator"
+    }
+
+    /// Pre-validation check (optional)
+    fn pre_validate(&self, credentials: &Credentials) -> AuthResult<()> {
+        if !credentials.is_valid_format() {
+            return Err(AuthError::InvalidCredentials);
+        }
+        Ok(())
+    }
+
+    /// Get user count
+    fn user_count(&self) -> usize {
+        0
     }
 }
 
@@ -73,22 +102,70 @@ impl Debug for dyn UserValidator {
 #[derive(Debug)]
 pub struct StaticUserValidator {
     users: HashMap<String, String>,
+    case_sensitive: bool,
 }
 
 impl StaticUserValidator {
+    /// Create a new static user validator
     pub fn new() -> Self {
         Self {
             users: HashMap::new(),
+            case_sensitive: true,
         }
     }
 
-    pub fn add_user(&mut self, username: String, password: String) -> &mut Self {
-        self.users.insert(username, password);
+    /// Set to case insensitive
+    pub fn case_insensitive(mut self) -> Self {
+        self.case_sensitive = false;
         self
     }
 
+    /// Add a user
+    pub fn add_user(&mut self, username: String, password: String) -> &mut Self {
+        let key = if self.case_sensitive {
+            username
+        } else {
+            username.to_lowercase()
+        };
+        self.users.insert(key, password);
+        self
+    }
+
+    /// Create validator from HashMap
     pub fn from_map(users: HashMap<String, String>) -> Self {
-        Self { users }
+        Self {
+            users,
+            case_sensitive: true,
+        }
+    }
+
+    /// Create validator from HashMap (case insensitive)
+    pub fn from_map_case_insensitive(users: HashMap<String, String>) -> Self {
+        let normalized_users: HashMap<String, String> = users
+            .into_iter()
+            .map(|(k, v)| (k.to_lowercase(), v))
+            .collect();
+
+        Self {
+            users: normalized_users,
+            case_sensitive: false,
+        }
+    }
+
+    /// Check if user exists
+    pub fn contains_user(&self, username: &str) -> bool {
+        let key = if self.case_sensitive {
+            username
+        } else {
+            &username.to_lowercase()
+        };
+        self.users.contains_key(key)
+    }
+}
+
+impl Default for StaticUserValidator {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -98,20 +175,26 @@ impl UserValidator for StaticUserValidator {
         credentials: &'a Credentials,
     ) -> Pin<Box<dyn Future<Output = AuthResult<bool>> + Send + 'a>> {
         Box::pin(async move {
-            match self.users.get(&credentials.username) {
-                Some(stored_password) => {
-                    #[cfg(feature = "timing-safe")]
-                    {
-                        Ok(credentials.verify_password(stored_password))
-                    }
-                    #[cfg(not(feature = "timing-safe"))]
-                    {
-                        Ok(stored_password == &credentials.password)
-                    }
-                }
+            let username = if self.case_sensitive {
+                &credentials.username
+            } else {
+                &credentials.username.to_lowercase()
+            };
+
+            match self.users.get(username) {
+                Some(stored_password) => Ok(credentials.verify_password(stored_password)),
                 None => Ok(false),
             }
         })
+    }
+
+    fn name(&self) -> &'static str {
+        "StaticUserValidator"
+    }
+
+    /// Get user count
+    fn user_count(&self) -> usize {
+        self.users.len()
     }
 }
 
@@ -120,30 +203,56 @@ impl UserValidator for StaticUserValidator {
 #[derive(Debug)]
 pub struct BcryptUserValidator {
     users: HashMap<String, String>, // username -> bcrypt hash
+    cost: u32,
 }
 
 #[cfg(feature = "bcrypt")]
 impl BcryptUserValidator {
+    /// Create a new BCrypt user validator
     pub fn new() -> Self {
         Self {
             users: HashMap::new(),
+            cost: bcrypt::DEFAULT_COST,
         }
     }
 
+    /// Set BCrypt cost factor
+    pub fn with_cost(mut self, cost: u32) -> Self {
+        self.cost = cost;
+        self
+    }
+
+    /// Add a user with precomputed BCrypt hash
     pub fn add_user(&mut self, username: String, bcrypt_hash: String) -> &mut Self {
         self.users.insert(username, bcrypt_hash);
         self
     }
 
+    /// Add a user with password, automatically hashing it with BCrypt
     pub fn add_user_with_password(
         &mut self,
         username: String,
         password: &str,
     ) -> AuthResult<&mut Self> {
-        let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST)
+        let hash = bcrypt::hash(password, self.cost)
             .map_err(|e| AuthError::ValidationFailed(format!("BCrypt hash failed: {}", e)))?;
         self.users.insert(username, hash);
         Ok(self)
+    }
+
+    /// Create validator from HashMap of usernames and BCrypt hashes
+    pub fn from_hashes(users: HashMap<String, String>) -> Self {
+        Self {
+            users,
+            cost: bcrypt::DEFAULT_COST,
+        }
+    }
+}
+
+#[cfg(feature = "bcrypt")]
+impl Default for BcryptUserValidator {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -156,214 +265,219 @@ impl UserValidator for BcryptUserValidator {
         Box::pin(async move {
             match self.users.get(&credentials.username) {
                 Some(stored_hash) => {
-                    bcrypt::verify(&credentials.password, stored_hash).map_err(|e| {
-                        AuthError::ValidationFailed(format!("BCrypt verify failed: {}", e))
-                    })
+                    // BCrypt验证是CPU密集型操作，在阻塞任务中运行
+                    let password = credentials.password.clone();
+                    let hash = stored_hash.clone();
+
+                    let result =
+                        tokio::task::spawn_blocking(move || bcrypt::verify(&password, &hash)).await;
+
+                    match result {
+                        Ok(Ok(is_valid)) => Ok(is_valid),
+                        Ok(Err(e)) => Err(AuthError::ValidationFailed(format!(
+                            "BCrypt verify failed: {}",
+                            e
+                        ))),
+                        Err(e) => Err(AuthError::InternalError(format!("Task join failed: {}", e))),
+                    }
                 }
                 None => Ok(false),
             }
         })
     }
-}
 
-/// Cache entry with TTL support
-#[cfg(feature = "cache")]
-#[derive(Debug, Clone)]
-struct CacheEntry {
-    value: bool,
-    expires_at: u64,
-}
-
-#[cfg(feature = "cache")]
-impl CacheEntry {
-    fn new(value: bool, ttl_seconds: u64) -> Self {
-        let expires_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() + ttl_seconds;
-        
-        Self { value, expires_at }
+    fn name(&self) -> &'static str {
+        "BcryptUserValidator"
     }
-    
-    fn is_expired(&self) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        now > self.expires_at
+
+    fn user_count(&self) -> usize {
+        self.users.len()
     }
 }
 
-/// Basic Authentication configuration
-#[derive(Debug)]
+/// Basic authentication config
 pub struct BasicAuthConfig {
+    /// Authentication realm (for WWW-Authenticate header)
     pub realm: String,
+    /// User validator
     pub validator: Arc<dyn UserValidator>,
     #[cfg(feature = "cache")]
-    pub cache_enabled: bool,
-    #[cfg(feature = "cache")]
-    pub cache_size_limit: usize,
-    #[cfg(feature = "cache")]
-    pub cache_ttl_seconds: u64,
+    /// Auth result cache (optional)
+    pub cache: Option<Arc<AuthCache>>,
+    /// Path filter (optional)
     pub path_filter: Option<Arc<crate::utils::PathFilter>>,
+    /// Request header size limit (bytes)
+    pub max_header_size: usize,
+    /// Log details on authentication failure
+    pub log_failures: bool,
+    /// Custom error handler
+    pub custom_error_handler:
+        Option<Arc<dyn Fn(&AuthError, &str) -> web::HttpResponse + Send + Sync>>,
 }
 
 impl BasicAuthConfig {
+    /// Create new basic auth config
     pub fn new(validator: Arc<dyn UserValidator>) -> Self {
         Self {
             realm: "Restricted Area".to_string(),
             validator,
             #[cfg(feature = "cache")]
-            cache_enabled: true,
-            #[cfg(feature = "cache")]
-            cache_size_limit: 1000,
-            #[cfg(feature = "cache")]
-            cache_ttl_seconds: 300, // 5 minutes default TTL
+            cache: None,
             path_filter: None,
+            max_header_size: 8192, // 8KB
+            log_failures: false,
+            custom_error_handler: None,
         }
     }
 
+    /// Set authentication realm
     pub fn realm(mut self, realm: String) -> Self {
         self.realm = realm;
         self
     }
 
     #[cfg(feature = "cache")]
+    /// Create auth config with cache config
+    pub fn with_cache(mut self, cache_config: CacheConfig) -> AuthResult<Self> {
+        self.cache = Some(Arc::new(AuthCache::new(cache_config)?));
+        Ok(self)
+    }
+
+    #[cfg(feature = "cache")]
+    /// Disable cache
     pub fn disable_cache(mut self) -> Self {
-        self.cache_enabled = false;
+        self.cache = None;
         self
     }
 
-    #[cfg(feature = "cache")]
-    pub fn cache_size_limit(mut self, limit: usize) -> Self {
-        self.cache_size_limit = limit;
-        self
-    }
-
-    #[cfg(feature = "cache")]
-    pub fn cache_ttl(mut self, seconds: u64) -> Self {
-        self.cache_ttl_seconds = seconds;
-        self
-    }
-
+    /// Set path filter
     pub fn path_filter(mut self, filter: crate::utils::PathFilter) -> Self {
         self.path_filter = Some(Arc::new(filter));
         self
     }
+
+    /// Set max request header size
+    pub fn max_header_size(mut self, size: usize) -> Self {
+        self.max_header_size = size;
+        self
+    }
+
+    /// Enable or disable logging on authentication failure
+    pub fn log_failures(mut self, enabled: bool) -> Self {
+        self.log_failures = enabled;
+        self
+    }
+
+    /// Set custom error handler function
+    pub fn custom_error_handler<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(&AuthError, &str) -> web::HttpResponse + Send + Sync + 'static,
+    {
+        self.custom_error_handler = Some(Arc::new(handler));
+        self
+    }
+
+    /// Validate config
+    pub fn validate(&self) -> AuthResult<()> {
+        if self.realm.is_empty() {
+            return Err(AuthError::ConfigError("realm cannot be empty".to_string()));
+        }
+        if self.max_header_size == 0 {
+            return Err(AuthError::ConfigError(
+                "max_header_size must be greater than 0".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
-/// Basic Authentication middleware
+/// Basic authentication middleware
 pub struct BasicAuth {
     pub(crate) config: BasicAuthConfig,
-    #[cfg(feature = "cache")]
-    auth_cache: Option<DashMap<String, CacheEntry>>,
 }
 
 impl BasicAuth {
-    pub fn new(config: BasicAuthConfig) -> Self {
-        #[cfg(feature = "cache")]
-        let auth_cache = if config.cache_enabled {
-            Some(DashMap::new())
-        } else {
-            None
-        };
-
-        Self { 
-            config,
-            #[cfg(feature = "cache")]
-            auth_cache,
-        }
+    /// Create new BasicAuth instance
+    pub fn new(config: BasicAuthConfig) -> AuthResult<Self> {
+        config.validate()?;
+        Ok(Self { config })
     }
 
     /// Create BasicAuth with static user list
-    pub fn with_users(users: HashMap<String, String>) -> Self {
+    pub fn with_users(users: HashMap<String, String>) -> AuthResult<Self> {
         let validator = Arc::new(StaticUserValidator::from_map(users));
         let config = BasicAuthConfig::new(validator);
         Self::new(config)
     }
 
-    /// Create BasicAuth with single user
-    pub fn with_user(username: String, password: String) -> Self {
+    /// Create BasicAuth with a single user
+    pub fn with_user(username: String, password: String) -> AuthResult<Self> {
         let mut users = HashMap::new();
         users.insert(username, password);
         Self::with_users(users)
     }
 
     /// Parse Authorization header and extract credentials
-    /// 支持包含冒号的密码
-    fn parse_credentials(auth_header: &str) -> AuthResult<Credentials> {
+    /// Supports colons in password
+    fn parse_credentials(auth_header: &str, max_size: usize) -> AuthResult<Credentials> {
+        if auth_header.len() > max_size {
+            return Err(AuthError::InvalidFormat);
+        }
+
         if !auth_header.starts_with("Basic ") {
             return Err(AuthError::InvalidFormat);
         }
 
         let encoded = &auth_header[6..]; // Remove "Basic " prefix
+
+        // Check Base64 string length
+        if encoded.len() > (max_size * 3 / 4) {
+            return Err(AuthError::InvalidFormat);
+        }
+
         let decoded = STANDARD
             .decode(encoded)
             .map_err(|_| AuthError::InvalidBase64)?;
 
         let decoded_str = String::from_utf8(decoded).map_err(|_| AuthError::InvalidBase64)?;
 
-        // 只在第一个冒号处分割，支持密码中包含冒号
+        // Split only at the first colon, support colons in password
         let colon_pos = decoded_str.find(':').ok_or(AuthError::InvalidFormat)?;
+
         let username = decoded_str[..colon_pos].to_string();
         let password = decoded_str[colon_pos + 1..].to_string();
 
-        Ok(Credentials { username, password })
+        let credentials = Credentials::new(username, password);
+
+        // Validate credentials format
+        if !credentials.is_valid_format() {
+            return Err(AuthError::InvalidCredentials);
+        }
+
+        Ok(credentials)
     }
 
     /// Check if credentials are cached and valid
     #[cfg(feature = "cache")]
     fn check_cache(&self, credentials: &Credentials) -> Option<bool> {
-        self.auth_cache.as_ref().and_then(|cache| {
-            let cache_key = credentials.cache_key();
-            cache.get(&cache_key).and_then(|entry| {
-                if entry.is_expired() {
-                    cache.remove(&cache_key);
-                    None
-                } else {
-                    Some(entry.value)
-                }
-            })
-        })
+        self.config.cache.as_ref()?.get(&credentials.cache_key())
     }
 
-    /// Cache authentication result with TTL
+    /// Cache authentication result
     #[cfg(feature = "cache")]
-    fn cache_result(&self, credentials: &Credentials, result: bool) {
-        if let Some(cache) = &self.auth_cache {
-            // Clean expired entries and limit cache size
-            if cache.len() >= self.config.cache_size_limit {
-                self.cleanup_cache(cache);
-            }
-
-            let cache_key = credentials.cache_key();
-            let entry = CacheEntry::new(result, self.config.cache_ttl_seconds);
-            cache.insert(cache_key, entry);
+    fn cache_result(&self, credentials: &Credentials, result: bool) -> AuthResult<()> {
+        if let Some(cache) = &self.config.cache {
+            cache.insert(credentials.cache_key(), result)?;
         }
-    }
-
-    /// Clean up expired cache entries
-    #[cfg(feature = "cache")]
-    fn cleanup_cache(&self, cache: &DashMap<String, CacheEntry>) {
-        cache.retain(|_, entry| !entry.is_expired());
-        
-        // If still too large after cleanup, clear half of it
-        if cache.len() >= self.config.cache_size_limit {
-            let keys_to_remove: Vec<String> = cache
-                .iter()
-                .take(cache.len() / 2)
-                .map(|item| item.key().clone())
-                .collect();
-            
-            for key in keys_to_remove {
-                cache.remove(&key);
-            }
-        }
+        Ok(())
     }
 
     /// Authenticate user credentials
     async fn authenticate(&self, credentials: &Credentials) -> AuthResult<bool> {
-        // Check cache first
+        // Pre-validation check
+        self.config.validator.pre_validate(credentials)?;
+
+        // Check cache
         #[cfg(feature = "cache")]
         {
             if let Some(cached_result) = self.check_cache(credentials) {
@@ -371,16 +485,38 @@ impl BasicAuth {
             }
         }
 
-        // Validate with configured validator
+        // Validate using configured validator
         let result = self.config.validator.validate(credentials).await?;
 
-        // Cache the result
+        // Cache result
         #[cfg(feature = "cache")]
         {
-            self.cache_result(credentials, result);
+            if let Err(e) = self.cache_result(credentials, result) {
+                // Cache failure should not affect authentication result, just log error
+                eprintln!("Failed to cache authentication result: {}", e);
+            }
         }
 
         Ok(result)
+    }
+
+    /// Handle authentication error
+    fn handle_auth_error(&self, error: &AuthError) -> web::HttpResponse {
+        if let Some(handler) = &self.config.custom_error_handler {
+            handler(error, &self.config.realm)
+        } else {
+            error.to_response(&self.config.realm)
+        }
+    }
+
+    /// Log authentication failure (if enabled)
+    fn log_auth_failure(&self, error: &AuthError, username: Option<&str>) {
+        if self.config.log_failures {
+            match username {
+                Some(user) => eprintln!("Authentication failed - user: {}, error: {}", user, error),
+                None => eprintln!("Authentication failed - error: {}", error),
+            }
+        }
     }
 }
 
@@ -395,15 +531,12 @@ impl<S> Middleware<S> for BasicAuth {
                     realm: self.config.realm.clone(),
                     validator: Arc::clone(&self.config.validator),
                     #[cfg(feature = "cache")]
-                    cache_enabled: self.config.cache_enabled,
-                    #[cfg(feature = "cache")]
-                    cache_size_limit: self.config.cache_size_limit,
-                    #[cfg(feature = "cache")]
-                    cache_ttl_seconds: self.config.cache_ttl_seconds,
+                    cache: self.config.cache.clone(),
                     path_filter: self.config.path_filter.clone(),
+                    max_header_size: self.config.max_header_size,
+                    log_failures: self.config.log_failures,
+                    custom_error_handler: self.config.custom_error_handler.clone(),
                 },
-                #[cfg(feature = "cache")]
-                auth_cache: self.auth_cache.clone(),
             },
         }
     }
@@ -427,66 +560,74 @@ where
         req: web::WebRequest<Err>,
         ctx: ServiceCtx<'_, Self>,
     ) -> Result<Self::Response, Self::Error> {
-        // Check if this path should skip authentication
+        // 检查此路径是否应跳过认证
         if let Some(filter) = &self.auth.config.path_filter {
             if filter.should_skip(req.path()) {
                 return ctx.call(&self.service, req).await;
             }
         }
 
-        // Extract Authorization header
+        // 提取Authorization头
         let auth_header = req
             .headers()
             .get("authorization")
             .and_then(|h| h.to_str().ok());
 
-        // Handle missing authorization header
+        // 处理缺少authorization头的情况
         let auth_header = match auth_header {
             Some(header) => header,
             None => {
-                let response = AuthError::MissingHeader.to_response(&self.auth.config.realm);
+                let error = AuthError::MissingHeader;
+                self.auth.log_auth_failure(&error, None);
+                let response = self.auth.handle_auth_error(&error);
                 return Ok(req.into_response(response));
             }
         };
 
-        // Parse credentials
-        let credentials = match BasicAuth::parse_credentials(auth_header) {
-            Ok(creds) => creds,
-            Err(err) => {
-                let response = err.to_response(&self.auth.config.realm);
-                return Ok(req.into_response(response));
-            }
-        };
+        // 解析凭据
+        let credentials =
+            match BasicAuth::parse_credentials(auth_header, self.auth.config.max_header_size) {
+                Ok(creds) => creds,
+                Err(err) => {
+                    self.auth.log_auth_failure(&err, None);
+                    let response = self.auth.handle_auth_error(&err);
+                    return Ok(req.into_response(response));
+                }
+            };
 
-        // Authenticate using BasicAuth methods
+        // 认证
         let is_authenticated = match self.auth.authenticate(&credentials).await {
             Ok(result) => result,
             Err(err) => {
-                let response = err.to_response(&self.auth.config.realm);
+                self.auth
+                    .log_auth_failure(&err, Some(&credentials.username));
+                let response = self.auth.handle_auth_error(&err);
                 return Ok(req.into_response(response));
             }
         };
 
         if !is_authenticated {
-            let response = AuthError::InvalidCredentials.to_response(&self.auth.config.realm);
+            let error = AuthError::InvalidCredentials;
+            self.auth
+                .log_auth_failure(&error, Some(&credentials.username));
+            let response = self.auth.handle_auth_error(&error);
             return Ok(req.into_response(response));
         }
 
-        // Add credentials to request extensions for downstream access
+        // 将凭据添加到请求扩展中供下游访问
         req.extensions_mut().insert(credentials);
 
-        // Continue with the request
+        // 继续处理请求
         ctx.call(&self.service, req).await
     }
 }
 
-// 保持原有测试，但添加新的安全性测试
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    #[ntex::test]
+    #[tokio::test]
     async fn test_static_validator() {
         let mut users = HashMap::new();
         users.insert("admin".to_string(), "secret".to_string());
@@ -494,49 +635,100 @@ mod tests {
 
         let validator = StaticUserValidator::from_map(users);
 
-        let valid_creds = Credentials {
-            username: "admin".to_string(),
-            password: "secret".to_string(),
-        };
-
-        let colon_password_creds = Credentials {
-            username: "user".to_string(),
-            password: "password:with:colons".to_string(),
-        };
+        let valid_creds = Credentials::new("admin".to_string(), "secret".to_string());
+        let colon_password_creds =
+            Credentials::new("user".to_string(), "password:with:colons".to_string());
+        let invalid_creds = Credentials::new("admin".to_string(), "wrong".to_string());
 
         assert!(validator.validate(&valid_creds).await.unwrap());
         assert!(validator.validate(&colon_password_creds).await.unwrap());
+        assert!(!validator.validate(&invalid_creds).await.unwrap());
     }
 
     #[test]
     fn test_parse_credentials_with_colons() {
-        // Test password containing colons
         use base64::Engine;
         let credentials = "admin:pass:word:with:colons";
         let encoded = STANDARD.encode(credentials.as_bytes());
         let auth_header = format!("Basic {}", encoded);
-        
-        let creds = BasicAuth::parse_credentials(&auth_header).unwrap();
+
+        let creds = BasicAuth::parse_credentials(&auth_header, 8192).unwrap();
         assert_eq!(creds.username, "admin");
         assert_eq!(creds.password, "pass:word:with:colons");
+    }
+
+    #[test]
+    fn test_credentials_validation() {
+        let valid_creds = Credentials::new("user".to_string(), "pass".to_string());
+        let invalid_creds1 = Credentials::new("user:name".to_string(), "pass".to_string());
+        let invalid_creds2 = Credentials::new("".to_string(), "pass".to_string());
+        let invalid_creds3 = Credentials::new("user".to_string(), "pass\nword".to_string());
+
+        assert!(valid_creds.is_valid_format());
+        assert!(!invalid_creds1.is_valid_format());
+        assert!(!invalid_creds2.is_valid_format());
+        assert!(!invalid_creds3.is_valid_format());
     }
 
     #[cfg(feature = "cache")]
     #[test]
     fn test_secure_cache_key() {
-        let creds = Credentials {
-            username: "admin".to_string(),
-            password: "secret".to_string(),
-        };
-        
+        let creds = Credentials::new("admin".to_string(), "secret".to_string());
+
         let key1 = creds.cache_key();
         let key2 = creds.cache_key();
-        
-        // Same credentials should produce same key
+
+        // 相同凭据应产生相同的键
         assert_eq!(key1, key2);
-        
-        // Key should not contain plaintext password
+
+        // 键不应包含明文密码
         assert!(!key1.contains("secret"));
         assert!(!key1.contains("admin"));
+    }
+
+    #[test]
+    fn test_case_insensitive_validator() {
+        let mut users = HashMap::new();
+        users.insert("admin".to_string(), "secret".to_string());
+
+        let validator = StaticUserValidator::from_map_case_insensitive(users);
+
+        assert!(validator.contains_user("admin"));
+        assert!(validator.contains_user("ADMIN"));
+        assert!(validator.contains_user("Admin"));
+    }
+
+    #[tokio::test]
+    async fn test_validator_pre_validation() {
+        let validator = StaticUserValidator::new();
+        let invalid_creds = Credentials::new("user:name".to_string(), "pass".to_string());
+
+        assert!(validator.pre_validate(&invalid_creds).is_err());
+    }
+
+    #[test]
+    fn test_config_validation() {
+        let validator = Arc::new(StaticUserValidator::new());
+
+        let valid_config = BasicAuthConfig::new(validator.clone());
+        assert!(valid_config.validate().is_ok());
+
+        let invalid_config = BasicAuthConfig::new(validator).realm("".to_string());
+        assert!(invalid_config.validate().is_err());
+    }
+
+    #[cfg(feature = "bcrypt")]
+    #[tokio::test]
+    async fn test_bcrypt_validator() {
+        let mut validator = BcryptUserValidator::new();
+        validator
+            .add_user_with_password("admin".to_string(), "secret")
+            .unwrap();
+
+        let valid_creds = Credentials::new("admin".to_string(), "secret".to_string());
+        let invalid_creds = Credentials::new("admin".to_string(), "wrong".to_string());
+
+        assert!(validator.validate(&valid_creds).await.unwrap());
+        assert!(!validator.validate(&invalid_creds).await.unwrap());
     }
 }

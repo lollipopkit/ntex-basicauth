@@ -3,7 +3,7 @@ name = "ntex-basicauth"
 version = "0.2.0"
 edition = "2024"
 authors = ["lollipopkit <a@lpkt.cn>"]
-description = "A secure Basic Authentication middleware for ntex web framework."
+description = "A Basic Authentication middleware for ntex web framework."
 license = "MIT"
 repository = "https://github.com/lollipopkit/ntex-basicauth"
 readme = "README.md"
@@ -11,29 +11,31 @@ keywords = ["ntex", "basic-auth", "middleware", "authentication", "security"]
 categories = ["web-programming", "authentication"]
 
 [features]
-default = ["json", "cache", "regex", "timing-safe", "tokio"]
+default = ["json", "cache", "regex", "timing-safe", "tokio", "bcrypt"]
 json = ["dep:serde", "dep:serde_json"]
 bcrypt = ["dep:bcrypt"]
-cache = [
-    "dep:sha2",
-    "dep:dashmap",
-] # Cache support requires sha2 for secure hashing
-regex = ["dep:regex"] # Path filtering requires regex
-timing-safe = [] # Timing-safe password comparison
+cache = ["dep:sha2", "dep:dashmap"]
+regex = ["dep:regex"]
+timing-safe = ["dep:subtle"]
 
 [dependencies]
-base64 = "0.22"
+base64 = "0"
 dashmap = { version = "6", optional = true }
 ntex = "2"
-serde = { version = "1.0", features = ["derive"], optional = true }
-serde_json = { version = "1.0", optional = true }
-bcrypt = { version = "0.15", optional = true }
-thiserror = "1.0"
-sha2 = { version = "0.10", optional = true }
-regex = { version = "1.0", optional = true }
-tokio = { version = "1.0", features = [
-    "time",
-], optional = true } # TTL support requires tokio for async operations
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+bcrypt = { version = "0", optional = true }
+thiserror = "1"
+sha2 = { version = "0", optional = true }
+regex = { version = "1", optional = true }
+subtle = { version = "2", optional = true }                       # For timing-safe comparisons
+tokio = { version = "1", features = ["time"], optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["test-util", "macros"] }
+tokio = { version = "1", features = ["test-util", "macros", "rt"] }
+ntex = { version = "2", features = ["rustls"] }
+tempfile = "3"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

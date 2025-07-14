@@ -1,10 +1,15 @@
-use crate::{Credentials, BasicAuth, BasicAuthConfig, UserValidator};
+//! Utility functions and helper types
+
+use crate::{Credentials, BasicAuth, BasicAuthConfig, UserValidator, AuthError, AuthResult};
 use ntex::web::{HttpRequest, WebRequest};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 #[cfg(feature = "regex")]
 use regex::Regex;
+
+#[cfg(feature = "cache")]
+use crate::cache::CacheConfig;
 
 /// Extract authenticated user credentials from request
 pub fn extract_credentials(req: &HttpRequest) -> Option<Credentials> {
@@ -18,7 +23,7 @@ pub fn extract_credentials_web<T>(req: &WebRequest<T>) -> Option<Credentials> {
 
 /// Get authenticated username from request
 pub fn get_username(req: &HttpRequest) -> Option<String> {
-    extract_credentials(req).map(|creds| creds.username)
+    extract_credentials(req).map(|creds| creds.username.clone())
 }
 
 /// Check if current user matches a specific username
@@ -26,19 +31,14 @@ pub fn is_user(req: &HttpRequest, username: &str) -> bool {
     get_username(req).map_or(false, |user| user == username)
 }
 
-/// Get authenticated username as &str from request (more efficient for comparisons)
-pub fn get_username_ref(req: &HttpRequest) -> Option<String> {
-    req.extensions().get::<Credentials>().map(|creds| creds.username.clone())
-}
-
 /// Path filter for conditional authentication
 #[derive(Debug, Clone)]
 pub struct PathFilter {
-    pub(crate) patterns: Vec<PathPattern>,
+    patterns: Vec<PathPattern>,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum PathPattern {
+enum PathPattern {
     Exact(String),
     Prefix(String),
     Suffix(String),
@@ -47,13 +47,14 @@ pub(crate) enum PathPattern {
 }
 
 impl PathFilter {
+    /// Create a new PathFilter instance
     pub fn new() -> Self {
         Self {
             patterns: Vec::new(),
         }
     }
 
-    /// Skip authentication for exact path match
+    /// Skip authentication for exact path
     pub fn skip_exact<P: Into<String>>(mut self, path: P) -> Self {
         self.patterns.push(PathPattern::Exact(path.into()));
         self
@@ -80,11 +81,10 @@ impl PathFilter {
         Ok(self)
     }
 
-    /// Skip authentication for paths matching regex pattern (feature disabled version)
+    /// Skip authentication for regex pattern (feature disabled version)
     #[cfg(not(feature = "regex"))]
-    pub fn skip_regex<P: Into<String>>(self, pattern: P) -> Result<Self, &'static str> {
-        let _ = pattern;
-        Err("Regex feature is not enabled. Enable with: features = [\"regex\"]")
+    pub fn skip_regex<P: Into<String>>(self, _pattern: P) -> Result<Self, AuthError> {
+        Err(AuthError::ConfigError("regex feature not enabled. Please use: features = [\"regex\"]".to_string()))
     }
 
     /// Skip authentication for multiple exact paths
@@ -111,6 +111,18 @@ impl PathFilter {
         self
     }
 
+    /// Skip authentication for multiple suffixes
+    pub fn skip_suffixes<I, P>(mut self, suffixes: I) -> Self 
+    where 
+        I: IntoIterator<Item = P>,
+        P: Into<String>,
+    {
+        for suffix in suffixes {
+            self.patterns.push(PathPattern::Suffix(suffix.into()));
+        }
+        self
+    }
+
     /// Check if path should skip authentication
     pub fn should_skip(&self, path: &str) -> bool {
         self.patterns.iter().any(|pattern| match pattern {
@@ -119,8 +131,6 @@ impl PathFilter {
             PathPattern::Suffix(suffix) => path.ends_with(suffix),
             #[cfg(feature = "regex")]
             PathPattern::Regex(regex) => regex.is_match(path),
-            #[cfg(not(feature = "regex"))]
-            PathPattern::Regex(_) => false,
         })
     }
 
@@ -133,6 +143,40 @@ impl PathFilter {
     pub fn is_empty(&self) -> bool {
         self.patterns.is_empty()
     }
+
+    /// Get all exact match paths
+    pub fn exact_paths(&self) -> Vec<&str> {
+        self.patterns.iter()
+            .filter_map(|pattern| match pattern {
+                PathPattern::Exact(path) => Some(path.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Get all prefixes
+    pub fn prefixes(&self) -> Vec<&str> {
+        self.patterns.iter()
+            .filter_map(|pattern| match pattern {
+                PathPattern::Prefix(prefix) => Some(prefix.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Clear all patterns
+    pub fn clear(mut self) -> Self {
+        self.patterns.clear();
+        self
+    }
+
+    /// Remove a specific exact path pattern
+    pub fn remove_exact_path(mut self, path: &str) -> Self {
+        self.patterns.retain(|pattern| {
+            !matches!(pattern, PathPattern::Exact(p) if p == path)
+        });
+        self
+    }
 }
 
 impl Default for PathFilter {
@@ -141,33 +185,32 @@ impl Default for PathFilter {
     }
 }
 
-/// Builder for BasicAuth with additional convenience methods
+/// Builder for BasicAuth, provides extra convenience methods
 pub struct BasicAuthBuilder {
     users: Option<HashMap<String, String>>,
     validator: Option<Arc<dyn UserValidator>>,
     realm: Option<String>,
     #[cfg(feature = "cache")]
-    cache_enabled: bool,
-    #[cfg(feature = "cache")]
-    cache_size_limit: usize,
-    #[cfg(feature = "cache")]
-    cache_ttl_seconds: u64,
+    cache_config: Option<CacheConfig>,
     path_filter: Option<PathFilter>,
+    max_header_size: Option<usize>,
+    log_failures: bool,
+    case_sensitive: bool,
 }
 
 impl BasicAuthBuilder {
+    /// Create a new BasicAuthBuilder instance
     pub fn new() -> Self {
         Self {
             users: None,
             validator: None,
             realm: None,
             #[cfg(feature = "cache")]
-            cache_enabled: true,
-            #[cfg(feature = "cache")]
-            cache_size_limit: 1000,
-            #[cfg(feature = "cache")]
-            cache_ttl_seconds: 300,
+            cache_config: None,
             path_filter: None,
+            max_header_size: None,
+            log_failures: false,
+            case_sensitive: true,
         }
     }
 
@@ -194,11 +237,47 @@ impl BasicAuthBuilder {
         U: Into<String>,
         P: Into<String>,
     {
-        let users_map = self.users.get_or_insert_with(HashMap::new);
+        let mut users_map = self.users.get_or_insert_with(HashMap::new).clone();
         for (username, password) in users {
             users_map.insert(username.into(), password.into());
         }
+        self.users = Some(users_map);
         self
+    }
+
+    /// Load users from file (format: username:password, one per line)
+    pub fn users_from_file<P: AsRef<std::path::Path>>(mut self, path: P) -> AuthResult<Self> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| AuthError::ConfigError(format!("Failed to read user file: {}", e)))?;
+        
+        let mut users_map = self.users.get_or_insert_with(HashMap::new).clone();
+        
+        for (line_num, line) in content.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue; // Skip empty lines and comments
+            }
+            
+            let colon_pos = line.find(':')
+                .ok_or_else(|| AuthError::ConfigError(
+                    format!("User file line {} format error: missing colon separator", line_num + 1)
+                ))?;
+            
+            let username = line[..colon_pos].trim().to_string();
+            let password = line[colon_pos + 1..].trim().to_string();
+            
+            if username.is_empty() {
+                return Err(AuthError::ConfigError(
+                    format!("User file line {} format error: username is empty", line_num + 1)
+                ));
+            }
+            
+            dbg!("Loaded user: {}   {}", &username, &password);
+            users_map.insert(username, password);
+        }
+        self.users = Some(users_map);
+        
+        Ok(self)
     }
 
     /// Set custom validator
@@ -213,53 +292,61 @@ impl BasicAuthBuilder {
         self
     }
 
+    /// Set username case sensitivity
+    pub fn case_sensitive(mut self, sensitive: bool) -> Self {
+        self.case_sensitive = sensitive;
+        self
+    }
+
+    /// Enable authentication cache
+    #[cfg(feature = "cache")]
+    pub fn with_cache(mut self, config: CacheConfig) -> Self {
+        self.cache_config = Some(config);
+        self
+    }
+
     /// Disable authentication cache
     #[cfg(feature = "cache")]
     pub fn disable_cache(mut self) -> Self {
-        self.cache_enabled = false;
+        self.cache_config = None;
         self
     }
 
-    /// Enable authentication cache (default)
-    #[cfg(feature = "cache")]
-    pub fn enable_cache(mut self) -> Self {
-        self.cache_enabled = true;
-        self
-    }
-
-    /// Set cache size limit
-    #[cfg(feature = "cache")]
-    pub fn cache_size_limit(mut self, limit: usize) -> Self {
-        self.cache_size_limit = limit;
-        self
-    }
-
-    /// Set cache TTL in seconds
+    /// Set cache TTL (seconds)
     #[cfg(feature = "cache")]
     pub fn cache_ttl_seconds(mut self, seconds: u64) -> Self {
-        self.cache_ttl_seconds = seconds;
+        let config = self.cache_config.take().unwrap_or_default();
+        self.cache_config = Some(config.ttl_seconds(seconds));
         self
     }
 
-    /// Set cache TTL in minutes (convenience method)
+    /// Set cache TTL (minutes, convenience)
     #[cfg(feature = "cache")]
     pub fn cache_ttl_minutes(self, minutes: u64) -> Self {
         self.cache_ttl_seconds(minutes * 60)
     }
 
-    /// Set cache TTL in hours (convenience method)
+    /// Set cache TTL (hours, convenience)
     #[cfg(feature = "cache")]
     pub fn cache_ttl_hours(self, hours: u64) -> Self {
         self.cache_ttl_seconds(hours * 3600)
     }
 
-    /// Set path filter for conditional authentication
+    /// Set cache size limit
+    #[cfg(feature = "cache")]
+    pub fn cache_size_limit(mut self, limit: usize) -> Self {
+        let config = self.cache_config.take().unwrap_or_default();
+        self.cache_config = Some(config.max_size(limit));
+        self
+    }
+
+    /// Set path filter
     pub fn path_filter(mut self, filter: PathFilter) -> Self {
         self.path_filter = Some(filter);
         self
     }
 
-    /// Configure path filter with builder pattern
+    /// Configure path filter (builder pattern)
     pub fn configure_paths<F>(mut self, configure: F) -> Self 
     where 
         F: FnOnce(PathFilter) -> PathFilter,
@@ -269,7 +356,7 @@ impl BasicAuthBuilder {
         self
     }
 
-    /// Add skip paths (convenience method)
+    /// Add skip paths (convenience)
     pub fn skip_paths<I, P>(mut self, paths: I) -> Self 
     where 
         I: IntoIterator<Item = P>,
@@ -281,16 +368,32 @@ impl BasicAuthBuilder {
         self
     }
 
+    /// Set request header size limit
+    pub fn max_header_size(mut self, size: usize) -> Self {
+        self.max_header_size = Some(size);
+        self
+    }
+
+    /// Enable authentication failure logging
+    pub fn log_failures(mut self, enabled: bool) -> Self {
+        self.log_failures = enabled;
+        self
+    }
+
     /// Build BasicAuth instance
-    pub fn build(self) -> Result<BasicAuth, crate::error::AuthError> {
+    pub fn build(self) -> AuthResult<BasicAuth> {
         let validator = if let Some(validator) = self.validator {
             validator
         } else if let Some(users) = self.users {
             use crate::auth::StaticUserValidator;
-            Arc::new(StaticUserValidator::from_map(users))
+            Arc::new(if self.case_sensitive {
+                StaticUserValidator::from_map(users)
+            } else {
+                StaticUserValidator::from_map_case_insensitive(users)
+            })
         } else {
-            return Err(crate::error::AuthError::ConfigError(
-                "Either validator or users must be provided".to_string()
+            return Err(AuthError::ConfigError(
+                "A validator or user list must be provided".to_string()
             ));
         };
 
@@ -302,22 +405,26 @@ impl BasicAuthBuilder {
         
         #[cfg(feature = "cache")]
         {
-            if !self.cache_enabled {
-                config = config.disable_cache();
+            if let Some(cache_config) = self.cache_config {
+                config = config.with_cache(cache_config)?;
             }
-            config = config.cache_size_limit(self.cache_size_limit);
-            config = config.cache_ttl(self.cache_ttl_seconds);
         }
 
         if let Some(filter) = self.path_filter {
             config = config.path_filter(filter);
         }
 
-        Ok(BasicAuth::new(config))
+        if let Some(size) = self.max_header_size {
+            config = config.max_header_size(size);
+        }
+
+        config = config.log_failures(self.log_failures);
+
+        BasicAuth::new(config)
     }
 
-    /// Build and wrap with error handling
-    pub fn try_build(self) -> crate::error::AuthResult<BasicAuth> {
+    /// Build and wrap error handling
+    pub fn try_build(self) -> AuthResult<BasicAuth> {
         self.build()
     }
 }
@@ -331,7 +438,8 @@ impl Default for BasicAuthBuilder {
 /// Convenience macro for creating PathFilter
 #[macro_export]
 macro_rules! path_filter {
-    (exact: [$($path:expr),*]) => {
+    // Only exact match
+    (exact: [$($path:expr),* $(,)?]) => {
         {
             let mut filter = $crate::PathFilter::new();
             $(
@@ -340,7 +448,9 @@ macro_rules! path_filter {
             filter
         }
     };
-    (prefix: [$($prefix:expr),*]) => {
+    
+    // Only prefix match
+    (prefix: [$($prefix:expr),* $(,)?]) => {
         {
             let mut filter = $crate::PathFilter::new();
             $(
@@ -349,7 +459,9 @@ macro_rules! path_filter {
             filter
         }
     };
-    (suffix: [$($suffix:expr),*]) => {
+    
+    // Only suffix match
+    (suffix: [$($suffix:expr),* $(,)?]) => {
         {
             let mut filter = $crate::PathFilter::new();
             $(
@@ -358,11 +470,13 @@ macro_rules! path_filter {
             filter
         }
     };
+    
+    // Mixed mode
     (
-        $(exact: [$($exact:expr),*])?
-        $(prefix: [$($prefix:expr),*])?
-        $(suffix: [$($suffix:expr),*])?
-        $(regex: [$($regex:expr),*])?
+        $(exact: [$($exact:expr),* $(,)?])?
+        $(prefix: [$($prefix:expr),* $(,)?])?
+        $(suffix: [$($suffix:expr),* $(,)?])?
+        $(regex: [$($regex:expr),* $(,)?])?
     ) => {
         {
             let mut filter = $crate::PathFilter::new();
@@ -387,6 +501,49 @@ macro_rules! path_filter {
             filter
         }
     };
+}
+
+/// Validate if username format is valid
+pub fn is_valid_username(username: &str) -> bool {
+    !username.is_empty() && 
+    !username.contains(':') && 
+    !username.contains('\n') &&
+    !username.contains('\r') &&
+    username.len() <= 255 && // Reasonable length limit
+    username.chars().all(|c| c.is_ascii_graphic() || c == ' ')
+}
+
+/// Create a PathFilter with common skip paths
+pub fn common_skip_paths() -> PathFilter {
+    PathFilter::new()
+        .skip_paths([
+            "/health",
+            "/healthcheck", 
+            "/ping",
+            "/status",
+            "/metrics",
+            "/favicon.ico"
+        ])
+        .skip_prefixes([
+            "/static/",
+            "/assets/",
+            "/public/",
+            "/.well-known/"
+        ])
+        .skip_suffixes([
+            ".css",
+            ".js",
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".gif",
+            ".ico",
+            ".svg",
+            ".woff",
+            ".woff2",
+            ".ttf",
+            ".eot"
+        ])
 }
 
 #[cfg(test)]
@@ -431,35 +588,80 @@ mod tests {
             .users_from_iter([("guest", "guest123")])
             .realm("Test Application")
             .skip_paths(["/health", "/metrics"])
+            .log_failures(true)
+            .case_sensitive(false)
+            .max_header_size(4096)
             .build()
             .expect("Valid configuration");
 
-        // Test that it was built successfully
         assert_eq!(auth.config.realm, "Test Application");
+        assert_eq!(auth.config.max_header_size, 4096);
+        assert!(auth.config.log_failures);
     }
 
     #[test]
-    fn test_macro_path_filter() {
-        let _filter = path_filter!(
-            exact: ["/health", "/status"]
-            prefix: ["/public/", "/assets/"]
-            suffix: [".css", ".js"]
-        );
-
-        // Test that macro compiles and creates valid filter
+    fn test_common_skip_paths() {
+        let filter = common_skip_paths();
+        
+        assert!(filter.should_skip("/health"));
+        assert!(filter.should_skip("/static/css/main.css"));
+        assert!(filter.should_skip("/favicon.ico"));
+        assert!(filter.should_skip("/public/images/logo.png"));
+        assert!(filter.should_skip("/.well-known/acme-challenge/test"));
+        assert!(!filter.should_skip("/api/users"));
     }
 
-    #[cfg(feature = "cache")]
     #[test]
-    fn test_builder_cache_configuration() {
-        let auth = BasicAuthBuilder::new()
-            .user("test", "password")
-            .cache_ttl_minutes(10)
-            .cache_size_limit(500)
-            .build()
-            .expect("Valid configuration");
+    fn test_username_validation() {
+        assert!(is_valid_username("admin"));
+        assert!(is_valid_username("user123"));
+        assert!(is_valid_username("test user")); // contains space
+        
+        assert!(!is_valid_username(""));
+        assert!(!is_valid_username("user:name")); // contains colon
+        assert!(!is_valid_username("user\nname")); // contains newline
+        assert!(!is_valid_username(&"a".repeat(256))); // too long
+    }
 
-        assert_eq!(auth.config.cache_ttl_seconds, 600); // 10 minutes
-        assert_eq!(auth.config.cache_size_limit, 500);
+    #[test]
+    fn test_builder_from_file() -> std::io::Result<()> {
+        use std::io::Write;
+        
+        // Create temporary file
+        let mut temp_file = tempfile::NamedTempFile::new()?;
+        writeln!(temp_file, "# This is a comment")?;
+        writeln!(temp_file, "admin:secret")?;
+        writeln!(temp_file, "user:password:with:colons")?;
+        writeln!(temp_file, "")?; // empty line
+        writeln!(temp_file, "guest:guest123")?;
+        
+        let builder = BasicAuthBuilder::new()
+            .users_from_file(temp_file.path())
+            .expect("Failed to load users from file");
+        
+        let auth = builder.build().expect("Failed to build authentication");
+        
+        // Verify users are loaded correctly
+        let validator = auth.config.validator.as_ref();
+        dbg!("User validator: {:?}", validator);
+        assert_eq!(validator.user_count(), 3);
+        
+        Ok(())
+    }
+
+    #[test]
+    fn test_path_filter_modification() {
+        let filter = PathFilter::new()
+            .skip_exact("/health")
+            .skip_exact("/status");
+        
+        assert_eq!(filter.pattern_count(), 2);
+        
+        let filter = filter.remove_exact_path("/health");
+        assert_eq!(filter.pattern_count(), 1);
+        
+        let filter = filter.clear();
+        assert_eq!(filter.pattern_count(), 0);
+        assert!(filter.is_empty());
     }
 }
