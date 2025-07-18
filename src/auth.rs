@@ -38,12 +38,12 @@ impl Credentials {
 
     /// Generate secure cache key (using SHA256 hash)
     #[cfg(feature = "cache")]
-    pub fn cache_key(&self) -> String {
+    pub fn cache_key(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(self.username.as_bytes());
         hasher.update(b":");
         hasher.update(self.password.as_bytes());
-        format!("{:x}", hasher.finalize())
+        hasher.finalize().into()
     }
 
     /// Timing-safe password verification to prevent timing attacks
@@ -66,8 +66,7 @@ impl Credentials {
     /// Validate credentials format
     pub fn is_valid_format(&self) -> bool {
         is_valid_username(&self.username)
-            && !self.password.contains('\n')
-            && !self.password.contains('\r')
+            && !self.password.chars().any(|c| c.is_control())
     }
 }
 
@@ -424,7 +423,12 @@ impl BasicAuth {
             return Err(AuthError::InvalidFormat);
         }
 
-        if !auth_header.starts_with("Basic ") {
+        if auth_header.len() < 6 {
+            return Err(AuthError::InvalidFormat);
+        }
+        
+        let scheme = &auth_header[..6];
+        if !scheme.eq_ignore_ascii_case("Basic ") {
             return Err(AuthError::InvalidFormat);
         }
 
@@ -457,46 +461,36 @@ impl BasicAuth {
         Ok(credentials)
     }
 
-    /// Check if credentials are cached and valid
-    #[cfg(feature = "cache")]
-    fn check_cache(&self, credentials: &Credentials) -> Option<bool> {
-        self.config.cache.as_ref()?.get(&credentials.cache_key())
-    }
-
-    /// Cache authentication result
-    #[cfg(feature = "cache")]
-    fn cache_result(&self, credentials: &Credentials, result: bool) -> AuthResult<()> {
-        if let Some(cache) = &self.config.cache {
-            cache.insert(credentials.cache_key(), result)?;
-        }
-        Ok(())
-    }
 
     /// Authenticate user credentials
     async fn authenticate(&self, credentials: &Credentials) -> AuthResult<bool> {
         // Pre-validation check
         self.config.validator.pre_validate(credentials)?;
 
-        // Check cache
+        // Check cache and cache result (compute key only once)
         #[cfg(feature = "cache")]
         {
-            if let Some(cached_result) = self.check_cache(credentials) {
-                return Ok(cached_result);
+            if let Some(cache) = &self.config.cache {
+                let cache_key = credentials.cache_key();
+                if let Some(cached_result) = cache.get(&cache_key) {
+                    return Ok(cached_result);
+                }
+                
+                // Validate using configured validator
+                let result = self.config.validator.validate(credentials).await?;
+                
+                // Cache result using the same key
+                if let Err(e) = cache.insert(cache_key, result) {
+                    // Cache failure should not affect authentication result, just log error
+                    eprintln!("Failed to cache authentication result: {}", e);
+                }
+                
+                return Ok(result);
             }
         }
 
-        // Validate using configured validator
+        // Validate using configured validator (when cache is disabled)
         let result = self.config.validator.validate(credentials).await?;
-
-        // Cache result
-        #[cfg(feature = "cache")]
-        {
-            if let Err(e) = self.cache_result(credentials, result) {
-                // Cache failure should not affect authentication result, just log error
-                eprintln!("Failed to cache authentication result: {}", e);
-            }
-        }
-
         Ok(result)
     }
 
@@ -660,11 +654,13 @@ mod tests {
     #[test]
     fn test_credentials_validation() {
         let valid_creds = Credentials::new("user".to_string(), "pass".to_string());
+        let valid_empty_user = Credentials::new("".to_string(), "pass".to_string()); // Now valid per RFC 7617
         let invalid_creds1 = Credentials::new("user:name".to_string(), "pass".to_string());
-        let invalid_creds2 = Credentials::new("".to_string(), "pass".to_string());
-        let invalid_creds3 = Credentials::new("user".to_string(), "pass\nword".to_string());
+        let invalid_creds2 = Credentials::new("user".to_string(), "pass\nword".to_string());
+        let invalid_creds3 = Credentials::new("user".to_string(), "pass\tword".to_string()); // Tab is control character
 
         assert!(valid_creds.is_valid_format());
+        assert!(valid_empty_user.is_valid_format());
         assert!(!invalid_creds1.is_valid_format());
         assert!(!invalid_creds2.is_valid_format());
         assert!(!invalid_creds3.is_valid_format());
@@ -681,9 +677,8 @@ mod tests {
         // The same credentials should produce the same cache key
         assert_eq!(key1, key2);
 
-        // Cache key should not contain sensitive information
-        assert!(!key1.contains("secret"));
-        assert!(!key1.contains("admin"));
+        // Cache key should be a 32-byte array (does not contain sensitive information)
+        assert_eq!(key1.len(), 32);
     }
 
     #[test]

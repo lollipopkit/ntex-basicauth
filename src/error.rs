@@ -108,7 +108,7 @@ impl AuthError {
 
         // Only add WWW-Authenticate header for authentication errors
         if status_code == StatusCode::UNAUTHORIZED {
-            let www_authenticate = format!("Basic realm=\"{}\"", self.escape_header_value(realm));
+            let www_authenticate = format!("Basic realm=\"{}\", charset=\"UTF-8\"", self.escape_header_value(realm));
             response = response.set_header("www-authenticate", www_authenticate);
         }
 

@@ -169,7 +169,7 @@ impl CacheConfig {
 
 /// Auth cache with TTL and auto cleanup
 pub struct AuthCache {
-    cache: Arc<DashMap<String, CacheEntry>>,
+    cache: Arc<DashMap<[u8; 32], CacheEntry>>,
     config: CacheConfig,
     stats: CacheStatistics,
     _cleanup_handle: Option<ntex::rt::JoinHandle<()>>,
@@ -203,7 +203,7 @@ impl AuthCache {
 
     /// Start background cleanup task
     fn start_cleanup_task(
-        cache: Arc<DashMap<String, CacheEntry>>,
+        cache: Arc<DashMap<[u8; 32], CacheEntry>>,
         config: CacheConfig,
         stats: CacheStatistics,
     ) -> ntex::rt::JoinHandle<()> {
@@ -228,7 +228,7 @@ impl AuthCache {
     }
 
     /// Get value from cache
-    pub fn get(&self, key: &str) -> Option<bool> {
+    pub fn get(&self, key: &[u8; 32]) -> Option<bool> {
         self.stats.add_access();
 
         if let Some(mut entry) = self.cache.get_mut(key) {
@@ -250,7 +250,7 @@ impl AuthCache {
     }
 
     /// Insert value into cache
-    pub fn insert(&self, key: String, value: bool) -> AuthResult<()> {
+    pub fn insert(&self, key: [u8; 32], value: bool) -> AuthResult<()> {
         // Check the size limit before insertion
         if self.cache.len() >= self.config.max_size {
             self.force_cleanup();
@@ -263,7 +263,7 @@ impl AuthCache {
     }
 
     /// Remove entry from cache
-    pub fn remove(&self, key: &str) -> Option<bool> {
+    pub fn remove(&self, key: &[u8; 32]) -> Option<bool> {
         self.cache.remove(key).map(|(_, entry)| {
             self.stats.add_removal();
             entry.value
@@ -329,7 +329,7 @@ impl AuthCache {
     }
 
     /// Check if the cache contains a key
-    pub fn contains_key(&self, key: &str) -> bool {
+    pub fn contains_key(&self, key: &[u8; 32]) -> bool {
         self.cache.contains_key(key)
     }
 
@@ -349,22 +349,22 @@ impl AuthCache {
     }
 
     /// Cleanup expired entries
-    fn cleanup_expired(cache: &DashMap<String, CacheEntry>) -> u64 {
+    fn cleanup_expired(cache: &DashMap<[u8; 32], CacheEntry>) -> u64 {
         let initial_len = cache.len();
         cache.retain(|_, entry| !entry.is_expired());
         (initial_len - cache.len()) as u64
     }
 
     /// Cleanup by hotness score
-    fn cleanup_by_hotness(cache: &DashMap<String, CacheEntry>, max_remove: usize) -> u64 {
-        if cache.len() == 0 {
+    fn cleanup_by_hotness(cache: &DashMap<[u8; 32], CacheEntry>, max_remove: usize) -> u64 {
+        if cache.is_empty() {
             return 0;
         }
 
         // Collect entries and their hotness scores
-        let mut entries: Vec<(String, f64)> = cache
+        let mut entries: Vec<([u8; 32], f64)> = cache
             .iter()
-            .map(|item| (item.key().clone(), item.value().hotness_score()))
+            .map(|item| (*item.key(), item.value().hotness_score()))
             .collect();
 
         // Sort by hotness score (ascending)
@@ -535,15 +535,17 @@ mod tests {
         let cache = AuthCache::new(config).unwrap();
 
         // Test insert and get
-        cache.insert("key1".to_string(), true).unwrap();
-        assert_eq!(cache.get("key1"), Some(true));
+        let key1 = [1u8; 32];
+        let key2 = [2u8; 32];
+        cache.insert(key1, true).unwrap();
+        assert_eq!(cache.get(&key1), Some(true));
 
         // Test non-existent key
-        assert_eq!(cache.get("nonexistent"), None);
+        assert_eq!(cache.get(&key2), None);
 
         // Test remove
-        assert_eq!(cache.remove("key1"), Some(true));
-        assert_eq!(cache.get("key1"), None);
+        assert_eq!(cache.remove(&key1), Some(true));
+        assert_eq!(cache.get(&key1), None);
     }
 
     #[tokio::test]
@@ -555,14 +557,15 @@ mod tests {
 
         let cache = AuthCache::new(config).unwrap();
 
-        cache.insert("key1".to_string(), true).unwrap();
-        assert_eq!(cache.get("key1"), Some(true));
+        let key1 = [1u8; 32];
+        cache.insert(key1, true).unwrap();
+        assert_eq!(cache.get(&key1), Some(true));
 
         // Wait for expiration
         sleep(Duration::from_secs(2)).await;
 
         // Should return None due to expiration
-        assert_eq!(cache.get("key1"), None);
+        assert_eq!(cache.get(&key1), None);
     }
 
     #[test]
@@ -570,13 +573,16 @@ mod tests {
         let config = CacheConfig::new().disable_auto_cleanup();
         let cache = AuthCache::new(config).unwrap();
 
-        cache.insert("key1".to_string(), true).unwrap();
-        cache.insert("key2".to_string(), false).unwrap();
+        let key1 = [1u8; 32];
+        let key2 = [2u8; 32];
+        let key3 = [3u8; 32];
+        cache.insert(key1, true).unwrap();
+        cache.insert(key2, false).unwrap();
 
         // Trigger some accesses to generate stats
-        cache.get("key1");
-        cache.get("key2");
-        cache.get("nonexistent");
+        cache.get(&key1);
+        cache.get(&key2);
+        cache.get(&key3);
 
         let stats = cache.stats();
         assert_eq!(stats.total_entries, 2);

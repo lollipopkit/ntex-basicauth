@@ -28,7 +28,7 @@ pub fn get_username(req: &HttpRequest) -> Option<String> {
 
 /// Check if current user matches a specific username
 pub fn is_user(req: &HttpRequest, username: &str) -> bool {
-    get_username(req).map_or(false, |user| user == username)
+    get_username(req).is_some_and(|user| user == username)
 }
 
 /// Path filter for conditional authentication
@@ -266,9 +266,10 @@ impl BasicAuthBuilder {
             let username = line[..colon_pos].trim().to_string();
             let password = line[colon_pos + 1..].trim().to_string();
             
-            if username.is_empty() {
+            // Allow empty usernames per RFC 7617
+            if !is_valid_username(&username) {
                 return Err(AuthError::ConfigError(
-                    format!("User file line {} format error: username is empty", line_num + 1)
+                    format!("User file line {} format error: invalid username format", line_num + 1)
                 ));
             }
             
@@ -505,7 +506,6 @@ macro_rules! path_filter {
 
 /// Validate if username format is valid
 pub fn is_valid_username(username: &str) -> bool {
-    !username.is_empty() && 
     !username.contains(':') && 
     !username.contains('\n') &&
     !username.contains('\r') &&
@@ -617,7 +617,8 @@ mod tests {
         assert!(is_valid_username("user123"));
         assert!(is_valid_username("test user")); // contains space
         
-        assert!(!is_valid_username(""));
+        // Now allows empty username per RFC 7617
+        assert!(is_valid_username(""));
         assert!(!is_valid_username("user:name")); // contains colon
         assert!(!is_valid_username("user\nname")); // contains newline
         assert!(!is_valid_username(&"a".repeat(256))); // too long
