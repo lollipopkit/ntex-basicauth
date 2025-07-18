@@ -592,7 +592,7 @@ pub fn is_valid_username(username: &str) -> bool {
 }
 
 /// Create a PathFilter with common skip paths
-pub fn common_skip_paths() -> PathFilter {
+pub(crate) fn common_skip_paths() -> PathFilter {
     PathFilter::new()
         .skip_paths([
             "/health",
