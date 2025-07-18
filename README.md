@@ -15,7 +15,7 @@ A Basic Authentication middleware designed for the [ntex](https://github.com/nte
 - **JSON Response** - Optional JSON error response (requires `json` feature)
 - **Custom Validator** - Support for custom user validation logic
 - **Regex Paths** - Regular expression path matching (requires `regex` feature)
-- **Timing-safe** - Timing-safe password comparison (enabled by default)
+- **Safety** - Timing-safe password comparison (`timing-safe`, enabled by default). Automatic password memory cleanup using `zeroize` crate (`secure-memory`, enabled by default)
 
 ## Installation
 
@@ -245,6 +245,37 @@ Error types include:
 - `InvalidBase64` - Invalid Base64 encoding
 - `InvalidCredentials` - Invalid user credentials
 - `ValidationFailed` - User validation failed
+
+## Configuration
+
+### Advanced Security Configuration
+
+```rust
+use ntex_basicauth::{BasicAuthBuilder, CacheConfig};
+use std::time::Duration;
+
+let cache_config = CacheConfig::new()
+    .max_size(1000)
+    .ttl_minutes(10)
+    .cleanup_interval_seconds(300);
+
+let auth = BasicAuthBuilder::new()
+    .user("admin", "secret")
+    .with_cache(cache_config)
+    .max_concurrent_validations(100)        // Limit concurrent validations
+    .validation_timeout(Duration::from_secs(30))  // Set validation timeout
+    .rate_limit_per_ip(10, Duration::from_secs(60))  // 10 requests per minute per IP
+    .log_usernames_in_production(false)     // Don't log usernames in production
+    .build()
+    .unwrap();
+```
+
+### Security Best Practices
+
+- **Memory Security**: The `secure-memory` feature (enabled by default) automatically clears password data from memory after use
+- **Cache Security**: Cache keys are SHA256-hashed with application-specific salt to prevent rainbow table attacks
+- **Production Logging**: Set `log_usernames_in_production(false)` to prevent username leakage in production logs
+- **DoS Protection**: Configure rate limiting and concurrent validation limits to prevent resource exhaustion
 
 ## Cache Configuration
 

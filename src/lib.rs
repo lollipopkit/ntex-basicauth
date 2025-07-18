@@ -46,7 +46,7 @@
 //! - `regex` (enabled by default): Regex path matching
 //! - `timing-safe` (enabled by default): Timing-safe password comparison
 //! - `bcrypt`: BCrypt password hash support
-//! - `tokio` (enabled by default): Tokio async runtime support
+//! - `secure-memory` (enabled by default): Secure memory cleanup for passwords
 
 #![doc(html_root_url = "https://docs.rs/ntex-basicauth/")]
 #![warn(missing_docs)]
@@ -60,22 +60,24 @@ mod utils;
 #[cfg(feature = "cache")]
 mod cache;
 
-// 核心类型导出
-pub use auth::{BasicAuth, BasicAuthConfig, Credentials, StaticUserValidator, UserValidator};
+// Core types and traits export
+pub use auth::{
+    AuthMetrics, BasicAuth, BasicAuthConfig, Credentials, StaticUserValidator, UserValidator,
+};
 pub use error::{AuthError, AuthResult};
 pub use utils::{
     BasicAuthBuilder, PathFilter, common_skip_paths, extract_credentials, extract_credentials_web,
     get_username, is_user, is_valid_username,
 };
 
-// 条件特性导出
+// Optional features
 #[cfg(feature = "bcrypt")]
 pub use auth::BcryptUserValidator;
 
 #[cfg(feature = "cache")]
 pub use cache::{AuthCache, CacheConfig, CacheStats};
 
-// 为了保持向后兼容性的别名
+// Alias for backward compatibility
 pub use auth::BasicAuth as BasicAuthMiddleware;
 
 /// Prelude module, includes common types and traits
@@ -85,8 +87,9 @@ pub use auth::BasicAuth as BasicAuthMiddleware;
 /// ```
 pub mod prelude {
     pub use crate::{
-        AuthError, AuthResult, BasicAuth, BasicAuthBuilder, BasicAuthConfig, Credentials,
-        PathFilter, StaticUserValidator, UserValidator, extract_credentials, get_username, is_user,
+        AuthError, AuthMetrics, AuthResult, BasicAuth, BasicAuthBuilder, BasicAuthConfig,
+        Credentials, PathFilter, StaticUserValidator, UserValidator, extract_credentials,
+        get_username, is_user,
     };
 
     #[cfg(feature = "bcrypt")]

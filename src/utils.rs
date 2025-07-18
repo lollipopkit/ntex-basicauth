@@ -4,12 +4,19 @@ use crate::{Credentials, BasicAuth, BasicAuthConfig, UserValidator, AuthError, A
 use ntex::web::{HttpRequest, WebRequest};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[cfg(feature = "regex")]
 use regex::Regex;
 
 #[cfg(feature = "cache")]
 use crate::cache::CacheConfig;
+
+#[cfg(feature = "regex")]
+use std::sync::OnceLock;
+
+#[cfg(feature = "regex")]
+static REGEX_CACHE: OnceLock<dashmap::DashMap<String, Regex>> = OnceLock::new();
 
 /// Extract authenticated user credentials from request
 pub fn extract_credentials(req: &HttpRequest) -> Option<Credentials> {
@@ -76,9 +83,23 @@ impl PathFilter {
     /// Requires "regex" feature
     #[cfg(feature = "regex")]
     pub fn skip_regex<P: AsRef<str>>(mut self, pattern: P) -> Result<Self, regex::Error> {
-        let regex = Regex::new(pattern.as_ref())?;
+        let regex = Self::get_cached_regex(pattern.as_ref())?;
         self.patterns.push(PathPattern::Regex(regex));
         Ok(self)
+    }
+
+    /// Get cached regex pattern for better performance
+    #[cfg(feature = "regex")]
+    fn get_cached_regex(pattern: &str) -> Result<Regex, regex::Error> {
+        let cache = REGEX_CACHE.get_or_init(|| dashmap::DashMap::new());
+        
+        if let Some(regex) = cache.get(pattern) {
+            Ok(regex.clone())
+        } else {
+            let regex = Regex::new(pattern)?;
+            cache.insert(pattern.to_string(), regex.clone());
+            Ok(regex)
+        }
     }
 
     /// Skip authentication for regex pattern (feature disabled version)
@@ -196,6 +217,12 @@ pub struct BasicAuthBuilder {
     max_header_size: Option<usize>,
     log_failures: bool,
     case_sensitive: bool,
+    // New enhanced configuration fields
+    max_concurrent_validations: Option<usize>,
+    validation_timeout: Option<Duration>,
+    rate_limit_per_ip: Option<(usize, Duration)>,
+    enable_metrics: bool,
+    log_usernames_in_production: bool,
 }
 
 impl BasicAuthBuilder {
@@ -211,6 +238,11 @@ impl BasicAuthBuilder {
             max_header_size: None,
             log_failures: false,
             case_sensitive: true,
+            max_concurrent_validations: None,
+            validation_timeout: None,
+            rate_limit_per_ip: None,
+            enable_metrics: true,
+            log_usernames_in_production: false,
         }
     }
 
@@ -381,6 +413,36 @@ impl BasicAuthBuilder {
         self
     }
 
+    /// Set maximum concurrent validations
+    pub fn max_concurrent_validations(mut self, max: usize) -> Self {
+        self.max_concurrent_validations = Some(max);
+        self
+    }
+
+    /// Set validation timeout
+    pub fn validation_timeout(mut self, timeout: Duration) -> Self {
+        self.validation_timeout = Some(timeout);
+        self
+    }
+
+    /// Set rate limiting per IP
+    pub fn rate_limit_per_ip(mut self, max_requests: usize, window: Duration) -> Self {
+        self.rate_limit_per_ip = Some((max_requests, window));
+        self
+    }
+
+    /// Enable or disable metrics collection
+    pub fn enable_metrics(mut self, enabled: bool) -> Self {
+        self.enable_metrics = enabled;
+        self
+    }
+
+    /// Enable or disable logging usernames in production (security risk)
+    pub fn log_usernames_in_production(mut self, enabled: bool) -> Self {
+        self.log_usernames_in_production = enabled;
+        self
+    }
+
     /// Build BasicAuth instance
     pub fn build(self) -> AuthResult<BasicAuth> {
         let validator = if let Some(validator) = self.validator {
@@ -420,6 +482,22 @@ impl BasicAuthBuilder {
         }
 
         config = config.log_failures(self.log_failures);
+
+        // Apply new enhanced configuration options
+        if let Some(max_concurrent) = self.max_concurrent_validations {
+            config = config.max_concurrent_validations(max_concurrent);
+        }
+
+        if let Some(timeout) = self.validation_timeout {
+            config = config.validation_timeout(timeout);
+        }
+
+        if let Some((max_requests, window)) = self.rate_limit_per_ip {
+            config = config.rate_limit_per_ip(max_requests, window);
+        }
+
+        config = config.enable_metrics(self.enable_metrics);
+        config = config.log_usernames_in_production(self.log_usernames_in_production);
 
         BasicAuth::new(config)
     }

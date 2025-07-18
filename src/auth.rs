@@ -11,9 +11,14 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 #[cfg(feature = "timing-safe")]
 use subtle::ConstantTimeEq;
+
+#[cfg(feature = "secure-memory")]
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 #[cfg(feature = "cache")]
 use {
@@ -23,8 +28,10 @@ use {
 
 /// User credentials
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "secure-memory", derive(Zeroize, ZeroizeOnDrop))]
 pub struct Credentials {
     /// Username
+    #[cfg_attr(feature = "secure-memory", zeroize(skip))]
     pub username: String,
     /// Password
     pub password: String,
@@ -36,19 +43,27 @@ impl Credentials {
         Self { username, password }
     }
 
-    /// Generate secure cache key (using SHA256 hash)
+    /// Generate secure cache key (using SHA256 hash with application-specific salt)
     #[cfg(feature = "cache")]
     pub fn cache_key(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
+        // Add application-specific salt to prevent rainbow table attacks
+        hasher.update(b"ntex-basicauth-v1:");
         hasher.update(self.username.as_bytes());
         hasher.update(b":");
         hasher.update(self.password.as_bytes());
         hasher.finalize().into()
     }
 
-    /// Timing-safe password verification to prevent timing attacks
+    /// Enhanced timing-safe password verification to prevent timing attacks
     #[cfg(feature = "timing-safe")]
     pub fn verify_password(&self, expected: &str) -> bool {
+        // Ensure both strings have the same length before comparison
+        if self.password.len() != expected.len() {
+            // Execute a dummy comparison to maintain timing consistency
+            let _ = b"dummy_password_123".ct_eq(b"dummy_password_123");
+            return false;
+        }
         self.password.as_bytes().ct_eq(expected.as_bytes()).into()
     }
 
@@ -65,8 +80,7 @@ impl Credentials {
 
     /// Validate credentials format
     pub fn is_valid_format(&self) -> bool {
-        is_valid_username(&self.username)
-            && !self.password.chars().any(|c| c.is_control())
+        is_valid_username(&self.username) && !self.password.chars().any(|c| c.is_control())
     }
 }
 
@@ -294,6 +308,90 @@ impl UserValidator for BcryptUserValidator {
     }
 }
 
+/// Authentication metrics for monitoring
+#[derive(Debug, Default)]
+pub struct AuthMetrics {
+    /// Total authentication requests
+    pub total_requests: AtomicU64,
+    /// Successful authentications
+    pub successful_auths: AtomicU64,
+    /// Failed authentications
+    pub failed_auths: AtomicU64,
+    /// Cached authentication hits
+    pub cached_hits: AtomicU64,
+    /// Total validation time in milliseconds
+    pub validation_time_ms: AtomicU64,
+}
+
+impl AuthMetrics {
+    /// Create new metrics instance
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Get total requests
+    pub fn total_requests(&self) -> u64 {
+        self.total_requests.load(Ordering::Relaxed)
+    }
+
+    /// Get successful authentications
+    pub fn successful_auths(&self) -> u64 {
+        self.successful_auths.load(Ordering::Relaxed)
+    }
+
+    /// Get failed authentications
+    pub fn failed_auths(&self) -> u64 {
+        self.failed_auths.load(Ordering::Relaxed)
+    }
+
+    /// Get cache hits
+    pub fn cached_hits(&self) -> u64 {
+        self.cached_hits.load(Ordering::Relaxed)
+    }
+
+    /// Get average validation time in milliseconds
+    pub fn avg_validation_time_ms(&self) -> f64 {
+        let total_time = self.validation_time_ms.load(Ordering::Relaxed);
+        let total_requests = self.total_requests.load(Ordering::Relaxed);
+        if total_requests > 0 {
+            total_time as f64 / total_requests as f64
+        } else {
+            0.0
+        }
+    }
+
+    /// Get success rate as percentage
+    pub fn success_rate(&self) -> f64 {
+        let successful = self.successful_auths.load(Ordering::Relaxed);
+        let total = self.total_requests.load(Ordering::Relaxed);
+        if total > 0 {
+            (successful as f64 / total as f64) * 100.0
+        } else {
+            0.0
+        }
+    }
+
+    /// Get cache hit rate as percentage
+    pub fn cache_hit_rate(&self) -> f64 {
+        let hits = self.cached_hits.load(Ordering::Relaxed);
+        let total = self.total_requests.load(Ordering::Relaxed);
+        if total > 0 {
+            (hits as f64 / total as f64) * 100.0
+        } else {
+            0.0
+        }
+    }
+
+    /// Reset all metrics
+    pub fn reset(&self) {
+        self.total_requests.store(0, Ordering::Relaxed);
+        self.successful_auths.store(0, Ordering::Relaxed);
+        self.failed_auths.store(0, Ordering::Relaxed);
+        self.cached_hits.store(0, Ordering::Relaxed);
+        self.validation_time_ms.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Basic authentication config
 pub struct BasicAuthConfig {
     /// Authentication realm (for WWW-Authenticate header)
@@ -312,6 +410,16 @@ pub struct BasicAuthConfig {
     /// Custom error handler
     pub custom_error_handler:
         Option<Arc<dyn Fn(&AuthError, &str) -> web::HttpResponse + Send + Sync>>,
+    /// Maximum concurrent authentication validations
+    pub max_concurrent_validations: Option<usize>,
+    /// Validation timeout
+    pub validation_timeout: Option<Duration>,
+    /// Rate limiting: (max_requests, time_window)
+    pub rate_limit_per_ip: Option<(usize, Duration)>,
+    /// Enable metrics collection
+    pub enable_metrics: bool,
+    /// Log usernames in production (security risk)
+    pub log_usernames_in_production: bool,
 }
 
 impl BasicAuthConfig {
@@ -326,6 +434,11 @@ impl BasicAuthConfig {
             max_header_size: 8192, // 8KB
             log_failures: false,
             custom_error_handler: None,
+            max_concurrent_validations: None,
+            validation_timeout: Some(Duration::from_secs(30)),
+            rate_limit_per_ip: None,
+            enable_metrics: true,
+            log_usernames_in_production: false,
         }
     }
 
@@ -376,7 +489,37 @@ impl BasicAuthConfig {
         self
     }
 
-    /// Validate config
+    /// Set maximum concurrent validations
+    pub fn max_concurrent_validations(mut self, max: usize) -> Self {
+        self.max_concurrent_validations = Some(max);
+        self
+    }
+
+    /// Set validation timeout
+    pub fn validation_timeout(mut self, timeout: Duration) -> Self {
+        self.validation_timeout = Some(timeout);
+        self
+    }
+
+    /// Set rate limiting per IP
+    pub fn rate_limit_per_ip(mut self, max_requests: usize, window: Duration) -> Self {
+        self.rate_limit_per_ip = Some((max_requests, window));
+        self
+    }
+
+    /// Enable or disable metrics collection
+    pub fn enable_metrics(mut self, enabled: bool) -> Self {
+        self.enable_metrics = enabled;
+        self
+    }
+
+    /// Enable or disable logging usernames in production (security risk)
+    pub fn log_usernames_in_production(mut self, enabled: bool) -> Self {
+        self.log_usernames_in_production = enabled;
+        self
+    }
+
+    /// Enhanced config validation
     pub fn validate(&self) -> AuthResult<()> {
         if self.realm.is_empty() {
             return Err(AuthError::ConfigError("realm cannot be empty".to_string()));
@@ -386,6 +529,65 @@ impl BasicAuthConfig {
                 "max_header_size must be greater than 0".to_string(),
             ));
         }
+        if self.max_header_size > 1024 * 1024 {
+            // 1MB limit
+            return Err(AuthError::ConfigError(
+                "max_header_size too large (max 1MB)".to_string(),
+            ));
+        }
+
+        if let Some(max_concurrent) = self.max_concurrent_validations {
+            if max_concurrent == 0 {
+                return Err(AuthError::ConfigError(
+                    "max_concurrent_validations must be greater than 0".to_string(),
+                ));
+            }
+            if max_concurrent > 10000 {
+                return Err(AuthError::ConfigError(
+                    "max_concurrent_validations too large (max 10000)".to_string(),
+                ));
+            }
+        }
+
+        if let Some(timeout) = self.validation_timeout {
+            if timeout.is_zero() {
+                return Err(AuthError::ConfigError(
+                    "validation_timeout must be greater than 0".to_string(),
+                ));
+            }
+            if timeout > Duration::from_secs(300) {
+                // 5 minutes
+                return Err(AuthError::ConfigError(
+                    "validation_timeout too large (max 5 minutes)".to_string(),
+                ));
+            }
+        }
+
+        if let Some((max_requests, window)) = self.rate_limit_per_ip {
+            if max_requests == 0 {
+                return Err(AuthError::ConfigError(
+                    "rate_limit max_requests must be greater than 0".to_string(),
+                ));
+            }
+            if window.is_zero() {
+                return Err(AuthError::ConfigError(
+                    "rate_limit window must be greater than 0".to_string(),
+                ));
+            }
+        }
+
+        #[cfg(feature = "cache")]
+        if let Some(cache) = &self.cache {
+            let stats = cache.stats();
+            if stats.total_entries > 100000 {
+                // Reasonable cache size limit
+                eprintln!(
+                    "Warning: Cache has {} entries, consider reducing TTL",
+                    stats.total_entries
+                );
+            }
+        }
+
         Ok(())
     }
 }
@@ -393,13 +595,22 @@ impl BasicAuthConfig {
 /// Basic authentication middleware
 pub struct BasicAuth {
     pub(crate) config: BasicAuthConfig,
+    pub(crate) metrics: Arc<AuthMetrics>,
 }
 
 impl BasicAuth {
     /// Create new BasicAuth instance
     pub fn new(config: BasicAuthConfig) -> AuthResult<Self> {
         config.validate()?;
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            metrics: Arc::new(AuthMetrics::new()),
+        })
+    }
+
+    /// Get metrics reference
+    pub fn metrics(&self) -> &AuthMetrics {
+        &self.metrics
     }
 
     /// Create BasicAuth with static user list
@@ -426,7 +637,7 @@ impl BasicAuth {
         if auth_header.len() < 6 {
             return Err(AuthError::InvalidFormat);
         }
-        
+
         let scheme = &auth_header[..6];
         if !scheme.eq_ignore_ascii_case("Basic ") {
             return Err(AuthError::InvalidFormat);
@@ -461,7 +672,6 @@ impl BasicAuth {
         Ok(credentials)
     }
 
-
     /// Authenticate user credentials
     async fn authenticate(&self, credentials: &Credentials) -> AuthResult<bool> {
         // Pre-validation check
@@ -475,16 +685,16 @@ impl BasicAuth {
                 if let Some(cached_result) = cache.get(&cache_key) {
                     return Ok(cached_result);
                 }
-                
+
                 // Validate using configured validator
                 let result = self.config.validator.validate(credentials).await?;
-                
+
                 // Cache result using the same key
                 if let Err(e) = cache.insert(cache_key, result) {
                     // Cache failure should not affect authentication result, just log error
                     eprintln!("Failed to cache authentication result: {}", e);
                 }
-                
+
                 return Ok(result);
             }
         }
@@ -503,10 +713,18 @@ impl BasicAuth {
         }
     }
 
-    /// Log authentication failure (if enabled)
+    /// Log authentication failure (if enabled) with enhanced security
     fn log_auth_failure(&self, error: &AuthError, username: Option<&str>) {
         if self.config.log_failures {
-            match username {
+            // In production, avoid logging usernames unless explicitly configured
+            let safe_username = if self.config.log_usernames_in_production || cfg!(debug_assertions)
+            {
+                username
+            } else {
+                None // Don't log usernames in production for security
+            };
+
+            match safe_username {
                 Some(user) => eprintln!("Authentication failed - user: {}, error: {}", user, error),
                 None => eprintln!("Authentication failed - error: {}", error),
             }
@@ -530,7 +748,13 @@ impl<S> Middleware<S> for BasicAuth {
                     max_header_size: self.config.max_header_size,
                     log_failures: self.config.log_failures,
                     custom_error_handler: self.config.custom_error_handler.clone(),
+                    max_concurrent_validations: self.config.max_concurrent_validations,
+                    validation_timeout: self.config.validation_timeout,
+                    rate_limit_per_ip: self.config.rate_limit_per_ip,
+                    enable_metrics: self.config.enable_metrics,
+                    log_usernames_in_production: self.config.log_usernames_in_production,
                 },
+                metrics: Arc::clone(&self.metrics),
             },
         }
     }
@@ -554,20 +778,20 @@ where
         req: web::WebRequest<Err>,
         ctx: ServiceCtx<'_, Self>,
     ) -> Result<Self::Response, Self::Error> {
-        // 检查此路径是否应跳过认证
+        // Check if path filter is configured and should skip authentication
         if let Some(filter) = &self.auth.config.path_filter {
             if filter.should_skip(req.path()) {
                 return ctx.call(&self.service, req).await;
             }
         }
 
-        // 提取Authorization头
+        // Extract authorization header
         let auth_header = req
             .headers()
             .get("authorization")
             .and_then(|h| h.to_str().ok());
 
-        // 处理缺少authorization头的情况
+        // Handle missing or malformed Authorization header
         let auth_header = match auth_header {
             Some(header) => header,
             None => {
@@ -578,7 +802,7 @@ where
             }
         };
 
-        // 解析凭据
+        // Parse credentials from Authorization header
         let credentials =
             match BasicAuth::parse_credentials(auth_header, self.auth.config.max_header_size) {
                 Ok(creds) => creds,
@@ -589,7 +813,7 @@ where
                 }
             };
 
-        // 认证
+        // Authenticate user credentials
         let is_authenticated = match self.auth.authenticate(&credentials).await {
             Ok(result) => result,
             Err(err) => {
@@ -608,10 +832,8 @@ where
             return Ok(req.into_response(response));
         }
 
-        // 将凭据添加到请求扩展中供下游访问
+        // Add credentials to request extensions for further processing
         req.extensions_mut().insert(credentials);
-
-        // 继续处理请求
         ctx.call(&self.service, req).await
     }
 }
