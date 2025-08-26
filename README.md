@@ -1,17 +1,18 @@
 # ntex-basicauth
 
-A Basic Authentication middleware designed for the [ntex](https://github.com/ntex-rs/ntex) web framework.
+A Basic Authentication middleware for the [ntex](https://github.com/ntex-rs/ntex) web framework.
 
 [![Crates.io](https://img.shields.io/crates/v/ntex-basicauth.svg)](https://crates.io/crates/ntex-basicauth)
 [![Documentation](https://docs.rs/ntex-basicauth/badge.svg)](https://docs.rs/ntex-basicauth)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-2024%2B-orange.svg)](https://www.rust-lang.org/)
 
 ## Features
 
 - **Cache** - Built-in authentication result cache to reduce validation overhead
 - **Flexible Configuration** - Supports multiple user validation methods
 - **Path Filtering** - Supports skipping authentication for specific paths
-- **BCrypt Support** - Optional BCrypt password hashing (requires `bcrypt` feature)
+- **BCrypt Support** - BCrypt password hashing (enabled by default, disable with `default-features = false`)
 - **JSON Response** - Optional JSON error response (requires `json` feature)
 - **Custom Validator** - Support for custom user validation logic
 - **Regex Paths** - Regular expression path matching (requires `regex` feature)
@@ -23,14 +24,14 @@ Add the dependency in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ntex-basicauth = "^0"
+ntex-basicauth = "0"
 ```
 
 Enable optional features if needed:
 
 ```toml
 [dependencies]
-ntex-basicauth = { version = "^0", features = ["bcrypt", "regex"] }
+ntex-basicauth = { version = "0", features = ["bcrypt", "regex"] }
 ```
 
 ## Quick Start
@@ -57,8 +58,11 @@ async fn main() -> std::io::Result<()> {
             .expect("Failed to configure authentication");
 
         web::App::new()
-            .wrap(auth)
-            .route("/protected", web::get().to(protected_handler))
+            .route(
+                web::scope("/protected")
+                    .wrap(auth)
+                    .route("/", web::get().to(protected_handler)),
+            )
             .route("/public", web::get().to(public_handler))
     })
     .bind("127.0.0.1:8080")?
@@ -105,7 +109,7 @@ Enable the `regex` feature in Cargo.toml:
 
 ```toml
 [dependencies]
-ntex-basicauth = { version = "^0", features = ["regex"] }
+ntex-basicauth = { version = "0", features = ["regex"] }
 ```
 
 ```rust
@@ -127,7 +131,7 @@ Enable the `bcrypt` feature in Cargo.toml:
 
 ```toml
 [dependencies]
-ntex-basicauth = { version = "^0", features = ["bcrypt"] }
+ntex-basicauth = { version = "0", features = ["bcrypt"] }
 ```
 
 ```rust
@@ -198,30 +202,44 @@ async fn handler(req: web::HttpRequest) -> web::Result<String> {
 }
 ```
 
-## PathFilter Macro
+## PathFilter Builder Pattern
 
-You can use the `path_filter!` macro for convenient filter creation:
+You can use the `PathFilter` builder for convenient filter creation:
 
 ```rust
-use ntex_basicauth::path_filter;
+use ntex_basicauth::PathFilter;
 
-let filter = path_filter!(
-    exact: ["/health", "/metrics"],
-    prefix: ["/public/"],
-    suffix: [".css", ".js"]
-);
+let filter = PathFilter::new()
+    .skip_exact("/health")
+    .skip_exact("/metrics")
+    .skip_prefix("/public/")
+    .skip_suffix(".css")
+    .skip_suffix(".js");
 ```
 
 ## Common Skip Paths
 
-Use built-in common skip paths:
+Use built-in common skip paths for typical web applications (health checks, static assets, etc.):
 
 ```rust
-use ntex_basicauth::{BasicAuthBuilder, common_skip_paths};
+use ntex_basicauth::{BasicAuthBuilder, PathFilter};
+
+// Create a filter with common web paths
+let common_filter = PathFilter::new()
+    .skip_exact("/health")
+    .skip_exact("/metrics")
+    .skip_exact("/favicon.ico")
+    .skip_prefix("/static/")
+    .skip_prefix("/assets/")
+    .skip_suffix(".css")
+    .skip_suffix(".js")
+    .skip_suffix(".png")
+    .skip_suffix(".jpg")
+    .skip_suffix(".ico");
 
 let auth = BasicAuthBuilder::new()
     .user("admin", "secret")
-    .path_filter(common_skip_paths())
+    .path_filter(common_filter)
     .build()
     .unwrap();
 ```
@@ -251,21 +269,32 @@ Error types include:
 ### Advanced Security Configuration
 
 ```rust
-use ntex_basicauth::{BasicAuthBuilder, CacheConfig};
+use ntex_basicauth::{BasicAuthBuilder, CacheConfig, PathFilter};
 use std::time::Duration;
 
+// Production-ready configuration with security hardening
 let cache_config = CacheConfig::new()
     .max_size(1000)
     .ttl_minutes(10)
     .cleanup_interval_seconds(300);
 
+// Common paths to skip authentication
+let skip_paths = PathFilter::new()
+    .skip_exact("/health")
+    .skip_exact("/metrics")
+    .skip_prefix("/static/")
+    .skip_suffix(".css")
+    .skip_suffix(".js");
+
 let auth = BasicAuthBuilder::new()
-    .user("admin", "secret")
+    .users_from_file("users.txt")           // Load users from file
+    .realm("Production API")
     .with_cache(cache_config)
-    .max_concurrent_validations(100)        // Limit concurrent validations
-    .validation_timeout(Duration::from_secs(30))  // Set validation timeout
-    .rate_limit_per_ip(10, Duration::from_secs(60))  // 10 requests per minute per IP
-    .log_usernames_in_production(false)     // Don't log usernames in production
+    .max_concurrent_validations(100)        // Prevent resource exhaustion
+    .validation_timeout(Duration::from_secs(30))
+    .rate_limit_per_ip(10, Duration::from_secs(60))  // 10 req/min per IP
+    .log_usernames_in_production(false)     // Security: no username logging
+    .path_filter(skip_paths)                // Skip health checks, assets
     .build()
     .unwrap();
 ```
@@ -284,10 +313,12 @@ Cache is enabled by default (unless disabled via builder/config):
 ```rust
 use ntex_basicauth::{BasicAuthBuilder, CacheConfig};
 
+// High-traffic configuration
 let cache_config = CacheConfig::new()
-    .max_size(1000)
-    .ttl_minutes(10)
-    .cleanup_interval_seconds(300);
+    .max_size(10000)                    // Large cache for busy servers
+    .ttl_minutes(5)                     // Short TTL for security
+    .cleanup_interval_seconds(60)       // Frequent cleanup
+    .enable_stats(true);                // Monitor cache performance
 
 let auth = BasicAuthBuilder::new()
     .user("admin", "secret")
@@ -298,4 +329,4 @@ let auth = BasicAuthBuilder::new()
 
 ## License
 
-This project is licensed under the MIT License.
+Licensed under the MIT License. See [LICENSE](LICENSE) for details.
