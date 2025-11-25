@@ -305,7 +305,6 @@ impl BasicAuthBuilder {
                 ));
             }
             
-            dbg!("Loaded user: {}   {}", &username, &password);
             users_map.insert(username, password);
         }
         self.users = Some(users_map);
@@ -592,7 +591,7 @@ pub fn is_valid_username(username: &str) -> bool {
 }
 
 /// Create a PathFilter with common skip paths
-pub(crate) fn common_skip_paths() -> PathFilter {
+pub fn common_skip_paths() -> PathFilter {
     PathFilter::new()
         .skip_paths([
             "/health",

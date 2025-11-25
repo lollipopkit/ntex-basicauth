@@ -12,7 +12,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "timing-safe")]
 use subtle::ConstantTimeEq;
@@ -390,6 +390,32 @@ impl AuthMetrics {
         self.cached_hits.store(0, Ordering::Relaxed);
         self.validation_time_ms.store(0, Ordering::Relaxed);
     }
+
+    /// Increment total authentication request counter
+    pub fn incr_total_requests(&self) {
+        self.total_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment successful authentication counter
+    pub fn incr_successful_auths(&self) {
+        self.successful_auths.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment failed authentication counter
+    pub fn incr_failed_auths(&self) {
+        self.failed_auths.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment cached authentication hit counter
+    pub fn incr_cached_hits(&self) {
+        self.cached_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Add validation time in milliseconds
+    pub fn add_validation_time(&self, duration: Duration) {
+        let ms = duration.as_millis() as u64;
+        self.validation_time_ms.fetch_add(ms, Ordering::Relaxed);
+    }
 }
 
 /// Basic authentication config
@@ -683,11 +709,20 @@ impl BasicAuth {
             if let Some(cache) = &self.config.cache {
                 let cache_key = credentials.cache_key();
                 if let Some(cached_result) = cache.get(&cache_key) {
+                    if self.config.enable_metrics {
+                        self.metrics.incr_cached_hits();
+                    }
                     return Ok(cached_result);
                 }
 
+                let start = Instant::now();
+
                 // Validate using configured validator
                 let result = self.config.validator.validate(credentials).await?;
+
+                if self.config.enable_metrics {
+                    self.metrics.add_validation_time(start.elapsed());
+                }
 
                 // Cache result using the same key
                 if let Err(e) = cache.insert(cache_key, result) {
@@ -700,7 +735,12 @@ impl BasicAuth {
         }
 
         // Validate using configured validator (when cache is disabled)
+        let start = Instant::now();
         let result = self.config.validator.validate(credentials).await?;
+
+        if self.config.enable_metrics {
+            self.metrics.add_validation_time(start.elapsed());
+        }
         Ok(result)
     }
 
@@ -778,11 +818,17 @@ where
         req: web::WebRequest<Err>,
         ctx: ServiceCtx<'_, Self>,
     ) -> Result<Self::Response, Self::Error> {
+        let metrics_enabled = self.auth.config.enable_metrics;
+
         // Check if path filter is configured and should skip authentication
         if let Some(filter) = &self.auth.config.path_filter {
             if filter.should_skip(req.path()) {
                 return ctx.call(&self.service, req).await;
             }
+        }
+
+        if metrics_enabled {
+            self.auth.metrics.incr_total_requests();
         }
 
         // Extract authorization header
@@ -798,6 +844,9 @@ where
                 let error = AuthError::MissingHeader;
                 self.auth.log_auth_failure(&error, None);
                 let response = self.auth.handle_auth_error(&error);
+                if metrics_enabled {
+                    self.auth.metrics.incr_failed_auths();
+                }
                 return Ok(req.into_response(response));
             }
         };
@@ -809,6 +858,9 @@ where
                 Err(err) => {
                     self.auth.log_auth_failure(&err, None);
                     let response = self.auth.handle_auth_error(&err);
+                    if metrics_enabled {
+                        self.auth.metrics.incr_failed_auths();
+                    }
                     return Ok(req.into_response(response));
                 }
             };
@@ -820,6 +872,9 @@ where
                 self.auth
                     .log_auth_failure(&err, Some(&credentials.username));
                 let response = self.auth.handle_auth_error(&err);
+                if metrics_enabled {
+                    self.auth.metrics.incr_failed_auths();
+                }
                 return Ok(req.into_response(response));
             }
         };
@@ -829,7 +884,14 @@ where
             self.auth
                 .log_auth_failure(&error, Some(&credentials.username));
             let response = self.auth.handle_auth_error(&error);
+            if metrics_enabled {
+                self.auth.metrics.incr_failed_auths();
+            }
             return Ok(req.into_response(response));
+        }
+
+        if metrics_enabled {
+            self.auth.metrics.incr_successful_auths();
         }
 
         // Add credentials to request extensions for further processing

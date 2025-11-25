@@ -66,8 +66,8 @@ pub use auth::{
 };
 pub use error::{AuthError, AuthResult};
 pub use utils::{
-    BasicAuthBuilder, PathFilter, extract_credentials, extract_credentials_web, get_username,
-    is_user, is_valid_username,
+    BasicAuthBuilder, PathFilter, common_skip_paths, extract_credentials, extract_credentials_web,
+    get_username, is_user, is_valid_username,
 };
 
 // Optional features
@@ -80,8 +80,6 @@ pub use cache::{AuthCache, CacheConfig, CacheStats};
 // Alias for backward compatibility
 pub use auth::BasicAuth as BasicAuthMiddleware;
 
-use crate::utils::common_skip_paths;
-
 /// Prelude module, includes common types and traits
 ///
 /// ```rust
@@ -90,8 +88,8 @@ use crate::utils::common_skip_paths;
 pub mod prelude {
     pub use crate::{
         AuthError, AuthMetrics, AuthResult, BasicAuth, BasicAuthBuilder, BasicAuthConfig,
-        Credentials, PathFilter, StaticUserValidator, UserValidator, extract_credentials,
-        get_username, is_user,
+        Credentials, PathFilter, StaticUserValidator, UserValidator, common_skip_paths,
+        extract_credentials, get_username, is_user,
     };
 
     #[cfg(feature = "bcrypt")]
