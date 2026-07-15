@@ -607,22 +607,32 @@ pub fn is_valid_username(username: &str) -> bool {
     username.chars().all(|c| c.is_ascii_graphic() || c == ' ')
 }
 
-/// Create a PathFilter with common skip paths
+/// Create a PathFilter with common skip paths.
+///
+/// Exempts liveness/readiness probes (`/health`, `/healthcheck`, `/ping`) and
+/// static assets from authentication. Observability endpoints such as
+/// `/metrics` and `/status` are intentionally **not** exempted, since they can
+/// leak internal state and should stay behind auth and per-IP rate limiting.
+/// If a deployment genuinely needs them public, opt in explicitly with
+/// [`observability_skip_paths`] or `.skip_paths([...])`.
 pub fn common_skip_paths() -> PathFilter {
     PathFilter::new()
-        .skip_paths([
-            "/health",
-            "/healthcheck",
-            "/ping",
-            "/status",
-            "/metrics",
-            "/favicon.ico",
-        ])
+        .skip_paths(["/health", "/healthcheck", "/ping", "/favicon.ico"])
         .skip_prefixes(["/static/", "/assets/", "/public/", "/.well-known/"])
         .skip_suffixes([
             ".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".woff", ".woff2",
             ".ttf", ".eot",
         ])
+}
+
+/// Create a PathFilter that exempts observability endpoints (`/metrics`,
+/// `/status`) from authentication.
+///
+/// Opt in only when these routes are meant to be public. Prefer keeping them
+/// authenticated; if you must expose them, restrict access at the network
+/// layer as well.
+pub fn observability_skip_paths() -> PathFilter {
+    PathFilter::new().skip_paths(["/metrics", "/status"])
 }
 
 #[cfg(test)]
@@ -682,12 +692,35 @@ mod tests {
     fn test_common_skip_paths() {
         let filter = common_skip_paths();
 
+        // Health/readiness probes and static assets remain public.
         assert!(filter.should_skip("/health"));
+        assert!(filter.should_skip("/healthcheck"));
+        assert!(filter.should_skip("/ping"));
         assert!(filter.should_skip("/static/css/main.css"));
         assert!(filter.should_skip("/favicon.ico"));
         assert!(filter.should_skip("/public/images/logo.png"));
         assert!(filter.should_skip("/.well-known/acme-challenge/test"));
+
+        // Each supported font suffix is treated as a static asset.
+        assert!(filter.should_skip("/assets/icons.woff"));
+        assert!(filter.should_skip("/assets/icons.woff2"));
+        assert!(filter.should_skip("/assets/icons.ttf"));
+        assert!(filter.should_skip("/assets/icons.eot"));
+
+        // Observability endpoints are NOT exempt: they must pass auth and
+        // per-IP rate limiting.
+        assert!(!filter.should_skip("/status"));
+        assert!(!filter.should_skip("/metrics"));
+
+        // Near-matches / unrelated routes still require auth.
         assert!(!filter.should_skip("/api/users"));
+        assert!(!filter.should_skip("/health/live")); // exact "/health" only, not a prefix
+        assert!(!filter.should_skip("/metrics.json")); // not the exact "/metrics"
+
+        // The opt-in helper re-exempts observability endpoints when needed.
+        let obs = observability_skip_paths();
+        assert!(obs.should_skip("/metrics"));
+        assert!(obs.should_skip("/status"));
     }
 
     #[test]

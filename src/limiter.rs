@@ -35,6 +35,17 @@ struct SemState {
     waiters: BTreeMap<u64, Waker>,
 }
 
+impl SemState {
+    /// Wake the longest-waiting task (front of the queue) so it can claim a
+    /// freed permit. Peeks without removing — the waiter removes itself when it
+    /// actually takes the permit, which keeps servicing strictly FIFO.
+    fn wake_front(&self) {
+        if let Some((_, waker)) = self.waiters.iter().next() {
+            waker.wake_by_ref();
+        }
+    }
+}
+
 impl ConcurrencyLimiter {
     /// Create a new limiter allowing up to `max` concurrent operations.
     pub fn new(max: usize) -> Self {
@@ -69,11 +80,7 @@ impl ConcurrencyLimiter {
     fn release(&self) {
         let mut st = self.inner.lock().expect("concurrency limiter poisoned");
         st.available += 1;
-        // Hand the freed permit to the longest-waiting task; it re-checks
-        // availability when polled.
-        if let Some((_, waker)) = st.waiters.pop_first() {
-            waker.wake();
-        }
+        st.wake_front();
     }
 }
 
@@ -90,17 +97,30 @@ impl Future for Acquire {
         let this = self.get_mut();
         let mut st = this.limiter.inner.lock().expect("concurrency limiter poisoned");
 
-        if st.available > 0 {
+        // A permit may be claimed only when we are first in line: either nobody
+        // is waiting, or we are the front (longest-waiting) waiter. This stops a
+        // freshly-polled acquire from barging ahead of already-queued waiters.
+        let is_front = match this.id {
+            Some(id) => st.waiters.keys().next() == Some(&id),
+            None => st.waiters.is_empty(),
+        };
+        if st.available > 0 && is_front {
             st.available -= 1;
             if let Some(id) = this.id.take() {
                 st.waiters.remove(&id);
+            }
+            // If permits remain, hand the next waiter its turn so a freed permit
+            // is not stranded.
+            if st.available > 0 {
+                st.wake_front();
             }
             return Poll::Ready(ConcurrencyPermit {
                 limiter: Arc::clone(&this.limiter),
             });
         }
 
-        // No permit yet: register (or refresh) our waker so `release` can wake us.
+        // No permit for us yet: register (or refresh) our waker so a released
+        // permit can wake us.
         let id = match this.id {
             Some(id) => id,
             None => {
@@ -117,12 +137,16 @@ impl Future for Acquire {
 
 impl Drop for Acquire {
     fn drop(&mut self) {
-        // If we parked but never received a permit, drop our waker so it is not
-        // woken (and, if we were the one just handed a permit, wake the next
-        // waiter so the permit is not lost).
+        // If we parked but never received a permit, drop our waker. If we were
+        // the front waiter (possibly just woken to claim a freed permit) and are
+        // giving up, pass the turn on so that permit is not stranded.
         if let Some(id) = self.id.take() {
             let mut st = self.limiter.inner.lock().expect("concurrency limiter poisoned");
+            let was_front = st.waiters.keys().next() == Some(&id);
             st.waiters.remove(&id);
+            if was_front && st.available > 0 {
+                st.wake_front();
+            }
         }
     }
 }
@@ -268,6 +292,37 @@ mod tests {
         assert_eq!(limiter.current(), 2); // _p2 + p3 held
         drop(p3);
         assert_eq!(limiter.current(), 1); // only _p2 held
+    }
+
+    #[tokio::test]
+    async fn test_concurrency_limiter_fifo_no_barging() {
+        // A freshly-arriving acquire must not steal a permit ahead of a task
+        // that is already queued.
+        let limiter = Arc::new(ConcurrencyLimiter::new(1));
+        let p1 = limiter.acquire().await; // available = 0
+
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut cx = Context::from_waker(&waker);
+
+        // `a` queues first and parks.
+        let mut a = Box::pin(limiter.acquire());
+        assert!(a.as_mut().poll(&mut cx).is_pending());
+
+        // Free the permit; `a` is now the front waiter.
+        drop(p1);
+
+        // `b` arrives afterwards and polls: it must NOT barge ahead of `a`.
+        let mut b = Box::pin(limiter.acquire());
+        assert!(
+            b.as_mut().poll(&mut cx).is_pending(),
+            "b must not take the permit ahead of the queued front waiter a"
+        );
+
+        // The front waiter `a` gets the permit.
+        assert!(
+            a.as_mut().poll(&mut cx).is_ready(),
+            "front waiter a should receive the freed permit"
+        );
     }
 
     struct NoopWake;

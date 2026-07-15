@@ -70,7 +70,7 @@ pub use error::{AuthError, AuthResult};
 pub use limiter::{ConcurrencyLimiter, RateLimiter};
 pub use utils::{
     BasicAuthBuilder, PathFilter, common_skip_paths, extract_credentials, extract_credentials_web,
-    get_username, is_user, is_valid_username,
+    get_username, is_user, is_valid_username, observability_skip_paths,
 };
 
 // Optional features
