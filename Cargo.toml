@@ -1,8 +1,8 @@
 [package]
 name = "ntex-basicauth"
-version = "0.3.1"
+version = "0.4.1"
 edition = "2024"
-authors = ["lollipopkit <a@lpkt.cn>"]
+authors = ["lollipopkit <a@lollipopkit.com>"]
 description = "A Basic Authentication middleware for ntex web framework."
 license = "MIT"
 repository = "https://github.com/lollipopkit/ntex-basicauth"
