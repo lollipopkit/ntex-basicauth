@@ -224,6 +224,7 @@ pub struct BasicAuthBuilder {
     max_concurrent_validations: Option<usize>,
     validation_timeout: Option<Duration>,
     rate_limit_per_ip: Option<(usize, Duration)>,
+    client_ip_header: Option<String>,
     enable_metrics: bool,
     log_usernames_in_production: bool,
 }
@@ -244,6 +245,7 @@ impl BasicAuthBuilder {
             max_concurrent_validations: None,
             validation_timeout: None,
             rate_limit_per_ip: None,
+            client_ip_header: None,
             enable_metrics: true,
             log_usernames_in_production: false,
         }
@@ -434,6 +436,14 @@ impl BasicAuthBuilder {
         self
     }
 
+    /// Set the header to read the client IP from for rate limiting (e.g.
+    /// `"x-forwarded-for"`). Only enable this behind a trusted proxy, since
+    /// clients can otherwise spoof the header to evade or forge rate limits.
+    pub fn client_ip_header(mut self, header: impl Into<String>) -> Self {
+        self.client_ip_header = Some(header.into());
+        self
+    }
+
     /// Enable or disable metrics collection
     pub fn enable_metrics(mut self, enabled: bool) -> Self {
         self.enable_metrics = enabled;
@@ -497,6 +507,10 @@ impl BasicAuthBuilder {
 
         if let Some((max_requests, window)) = self.rate_limit_per_ip {
             config = config.rate_limit_per_ip(max_requests, window);
+        }
+
+        if let Some(header) = self.client_ip_header {
+            config = config.client_ip_header(header);
         }
 
         config = config.enable_metrics(self.enable_metrics);

@@ -454,6 +454,11 @@ pub struct BasicAuthConfig {
     pub validation_timeout: Option<Duration>,
     /// Rate limiting: (max_requests, time_window)
     pub rate_limit_per_ip: Option<(usize, Duration)>,
+    /// Header to read the client IP from for rate limiting (e.g.
+    /// `"x-forwarded-for"`). When set, the first address in the header is used
+    /// instead of the transport peer address. Only enable behind a trusted
+    /// proxy, since clients can spoof this header.
+    pub client_ip_header: Option<String>,
     /// Enable metrics collection
     pub enable_metrics: bool,
     /// Log usernames in production (security risk)
@@ -475,6 +480,7 @@ impl BasicAuthConfig {
             max_concurrent_validations: None,
             validation_timeout: Some(Duration::from_secs(30)),
             rate_limit_per_ip: None,
+            client_ip_header: None,
             enable_metrics: true,
             log_usernames_in_production: false,
         }
@@ -542,6 +548,14 @@ impl BasicAuthConfig {
     /// Set rate limiting per IP
     pub fn rate_limit_per_ip(mut self, max_requests: usize, window: Duration) -> Self {
         self.rate_limit_per_ip = Some((max_requests, window));
+        self
+    }
+
+    /// Set the header to read the client IP from for rate limiting (e.g.
+    /// `"x-forwarded-for"`). Only enable this behind a trusted proxy, since
+    /// clients can otherwise spoof the header to evade or forge rate limits.
+    pub fn client_ip_header(mut self, header: impl Into<String>) -> Self {
+        self.client_ip_header = Some(header.into());
         self
     }
 
@@ -763,23 +777,73 @@ impl BasicAuth {
     }
 
     /// Run the configured validator, applying the optional concurrency limit
-    /// and validation timeout. The concurrency permit is held for the duration
-    /// of the validation and released on early return or timeout via `Drop`.
+    /// and validation timeout.
+    ///
+    /// When a concurrency limiter is configured, validation runs inside a
+    /// spawned task so the permit is held until the validator actually finishes
+    /// — even if *this* call times out. That keeps `max_concurrent_validations`
+    /// effective for validators that cannot be cancelled (e.g. bcrypt on a
+    /// blocking thread): a timed-out request no longer releases its permit early
+    /// and lets work pile up past the limit. Permit acquisition is also covered
+    /// by the timeout, so a saturated limiter cannot make a request wait longer
+    /// than `validation_timeout`.
     async fn run_validation(&self, credentials: &Credentials) -> AuthResult<bool> {
-        let _permit = if let Some(limiter) = &self.concurrency_limiter {
-            Some(limiter.acquire().await)
-        } else {
-            None
+        // Without a concurrency limiter there is no permit to protect, so we can
+        // validate directly (optionally under a timeout).
+        let Some(limiter) = &self.concurrency_limiter else {
+            let validate = self.config.validator.validate(credentials);
+            return match self.config.validation_timeout {
+                Some(timeout_dur) => timeout(timeout_dur, validate)
+                    .await
+                    .map_err(|_| AuthError::InternalError("Validation timed out".to_string()))?,
+                None => validate.await,
+            };
         };
 
-        let validate = self.config.validator.validate(credentials);
-        if let Some(timeout_dur) = self.config.validation_timeout {
-            timeout(timeout_dur, validate)
+        let validator = Arc::clone(&self.config.validator);
+        let limiter = Arc::clone(limiter);
+        let credentials = credentials.clone();
+
+        let task = ntex::rt::spawn(async move {
+            // Held until validation completes, even if the caller times out below.
+            let _permit = limiter.acquire().await;
+            validator.validate(&credentials).await
+        });
+
+        match self.config.validation_timeout {
+            Some(timeout_dur) => match timeout(timeout_dur, task).await {
+                Ok(join_result) => join_result
+                    .map_err(|_| AuthError::InternalError("Validation task failed".to_string()))?,
+                Err(_) => Err(AuthError::InternalError("Validation timed out".to_string())),
+            },
+            None => task
                 .await
-                .map_err(|_| AuthError::InternalError("Validation timed out".to_string()))?
-        } else {
-            validate.await
+                .map_err(|_| AuthError::InternalError("Validation task failed".to_string()))?,
         }
+    }
+
+    /// Resolve the client IP used for rate limiting.
+    ///
+    /// When `client_ip_header` is configured (trusted-proxy deployments), the
+    /// first address in that header wins; otherwise the transport peer address
+    /// is used. Only enable the header when running behind a trusted proxy,
+    /// since clients can otherwise spoof it to evade or forge rate limits.
+    fn client_ip<Err>(&self, req: &web::WebRequest<Err>) -> String
+    where
+        Err: web::ErrorRenderer,
+    {
+        if let Some(header) = &self.config.client_ip_header
+            && let Some(value) = req.headers().get(header).and_then(|v| v.to_str().ok())
+            && let Some(first) = value.split(',').next()
+        {
+            let ip = first.trim();
+            if !ip.is_empty() {
+                return ip.to_string();
+            }
+        }
+        req.peer_addr()
+            .map(|addr| addr.ip().to_string())
+            .unwrap_or_default()
     }
 
     /// Handle authentication error
@@ -829,6 +893,7 @@ impl<S, Cfg> Middleware<S, Cfg> for BasicAuth {
                     max_concurrent_validations: self.config.max_concurrent_validations,
                     validation_timeout: self.config.validation_timeout,
                     rate_limit_per_ip: self.config.rate_limit_per_ip,
+                    client_ip_header: self.config.client_ip_header.clone(),
                     enable_metrics: self.config.enable_metrics,
                     log_usernames_in_production: self.config.log_usernames_in_production,
                 },
@@ -873,10 +938,7 @@ where
 
         // Per-IP rate limiting (checked before credential parsing)
         if let Some(rate_limiter) = &self.auth.rate_limiter {
-            let ip = req
-                .peer_addr()
-                .map(|addr| addr.ip().to_string())
-                .unwrap_or_default();
+            let ip = self.auth.client_ip(&req);
             if let Err(err) = rate_limiter.check(&ip) {
                 self.auth.log_auth_failure(&err, None);
                 let response = self.auth.handle_auth_error(&err);
@@ -1160,5 +1222,83 @@ mod tests {
         let resp = ntex::web::test::call_service(&app, req).await;
         // Validation timed out -> InternalError (500).
         assert_eq!(resp.status(), ntex::http::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[ntex::test]
+    async fn test_concurrency_limited_auth_succeeds() {
+        use base64::Engine;
+
+        // Exercises the spawned-task validation path (concurrency limiter set +
+        // default timeout): a normal request must still authenticate.
+        let auth = crate::BasicAuthBuilder::new()
+            .user("admin", "secret")
+            .max_concurrent_validations(2)
+            .build()
+            .unwrap();
+        let app = ntex::web::test::init_service(
+            ntex::web::App::new()
+                .middleware(auth)
+                .route("/", ntex::web::get().to(|| async { "ok" })),
+        )
+        .await;
+
+        let auth_hdr = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("admin:secret")
+        );
+        let req = ntex::web::test::TestRequest::get()
+            .header("authorization", auth_hdr.as_str())
+            .to_request();
+        let resp = ntex::web::test::call_service(&app, req).await;
+        assert!(resp.status().is_success());
+    }
+
+    #[ntex::test]
+    async fn test_rate_limit_uses_forwarded_header() {
+        use base64::Engine;
+        use std::time::Duration;
+
+        // With client_ip_header configured, rate limiting keys on the forwarded
+        // client IP rather than the (shared) proxy peer address.
+        let auth = crate::BasicAuthBuilder::new()
+            .user("admin", "secret")
+            .rate_limit_per_ip(1, Duration::from_secs(60))
+            .client_ip_header("x-forwarded-for")
+            .build()
+            .unwrap();
+        let app = ntex::web::test::init_service(
+            ntex::web::App::new()
+                .middleware(auth)
+                .route("/", ntex::web::get().to(|| async { "ok" })),
+        )
+        .await;
+        let auth_hdr = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("admin:secret")
+        );
+
+        // Two requests from the same forwarded IP: second exceeds the 1/60s limit.
+        for (i, expect_ok) in [(0u8, true), (1u8, false)] {
+            let req = ntex::web::test::TestRequest::get()
+                .header("authorization", auth_hdr.as_str())
+                .header("x-forwarded-for", "9.9.9.9, 10.0.0.1")
+                .to_request();
+            let resp = ntex::web::test::call_service(&app, req).await;
+            assert_eq!(
+                resp.status().is_success(),
+                expect_ok,
+                "request {i} unexpected status {}",
+                resp.status()
+            );
+        }
+
+        // A different forwarded IP has its own budget even though the peer
+        // address (absent here) is identical.
+        let req = ntex::web::test::TestRequest::get()
+            .header("authorization", auth_hdr.as_str())
+            .header("x-forwarded-for", "8.8.8.8")
+            .to_request();
+        let resp = ntex::web::test::call_service(&app, req).await;
+        assert!(resp.status().is_success());
     }
 }
