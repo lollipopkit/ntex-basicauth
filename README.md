@@ -60,7 +60,7 @@ async fn main() -> std::io::Result<()> {
         web::App::new()
             .route(
                 web::scope("/protected")
-                    .wrap(auth)
+                    .middleware(auth)
                     .route("/", web::get().to(protected_handler)),
             )
             .route("/public", web::get().to(public_handler))

@@ -12,7 +12,7 @@
 //! #[ntex::main]
 //! async fn main() -> std::io::Result<()> {
 //!
-//!     web::HttpServer::new(move || {
+//!     web::HttpServer::new(async || {
 //!         // Create authentication middleware
 //!         let auth = BasicAuthBuilder::new()
 //!             .user("admin", "secret")
@@ -21,7 +21,7 @@
 //!             .build()
 //!             .expect("Failed to configure authentication");
 //!         web::App::new()
-//!             .wrap(auth)
+//!             .middleware(auth)
 //!             .route("/protected", web::get().to(protected_handler))
 //!             .route("/public", web::get().to(public_handler))
 //!     })
@@ -55,6 +55,7 @@
 
 mod auth;
 mod error;
+mod limiter;
 mod utils;
 
 #[cfg(feature = "cache")]
@@ -62,12 +63,14 @@ mod cache;
 
 // Core types and traits export
 pub use auth::{
-    AuthMetrics, BasicAuth, BasicAuthConfig, Credentials, StaticUserValidator, UserValidator,
+    AuthMetrics, BasicAuth, BasicAuthConfig, Credentials, CustomErrorHandler, StaticUserValidator,
+    UserValidator,
 };
 pub use error::{AuthError, AuthResult};
+pub use limiter::{ConcurrencyLimiter, RateLimiter};
 pub use utils::{
     BasicAuthBuilder, PathFilter, common_skip_paths, extract_credentials, extract_credentials_web,
-    get_username, is_user, is_valid_username,
+    get_username, is_user, is_valid_username, observability_skip_paths,
 };
 
 // Optional features
@@ -207,22 +210,21 @@ pub struct LibInfo {
 
 /// Get library detailed info
 pub fn lib_info() -> LibInfo {
-    let mut features = Vec::new();
-
-    #[cfg(feature = "json")]
-    features.push("json");
-
-    #[cfg(feature = "cache")]
-    features.push("cache");
-
-    #[cfg(feature = "regex")]
-    features.push("regex");
-
-    #[cfg(feature = "timing-safe")]
-    features.push("timing-safe");
-
-    #[cfg(feature = "bcrypt")]
-    features.push("bcrypt");
+    let features: Vec<&'static str> = [
+        #[cfg(feature = "json")]
+        "json",
+        #[cfg(feature = "cache")]
+        "cache",
+        #[cfg(feature = "regex")]
+        "regex",
+        #[cfg(feature = "timing-safe")]
+        "timing-safe",
+        #[cfg(feature = "bcrypt")]
+        "bcrypt",
+        #[cfg(feature = "secure-memory")]
+        "secure-memory",
+    ]
+    .into();
 
     LibInfo {
         version: VERSION,
@@ -297,10 +299,14 @@ mod tests {
     fn test_lib_info_features() {
         let info = lib_info();
 
-        // Check if all expected features are enabled
+        // Each compiled feature should be reported as enabled
+        #[cfg(feature = "json")]
         assert!(info.enabled_features.contains(&"json"));
+        #[cfg(feature = "cache")]
         assert!(info.enabled_features.contains(&"cache"));
+        #[cfg(feature = "regex")]
         assert!(info.enabled_features.contains(&"regex"));
+        #[cfg(feature = "timing-safe")]
         assert!(info.enabled_features.contains(&"timing-safe"));
 
         println!("Enabled features: {:?}", info.enabled_features);

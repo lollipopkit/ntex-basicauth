@@ -2,8 +2,8 @@
 
 use dashmap::DashMap;
 use ntex::time::interval;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::{AuthError, AuthResult};
@@ -172,7 +172,10 @@ pub struct AuthCache {
     cache: Arc<DashMap<[u8; 32], CacheEntry>>,
     config: CacheConfig,
     stats: CacheStatistics,
-    _cleanup_handle: Option<ntex::rt::JoinHandle<()>>,
+    // Held to keep the background cleanup task alive. Wrapped in a `Mutex` so
+    // that `AuthCache` stays `Send + Sync` even though the runtime's
+    // `JoinHandle` is `Send` but not `Sync` (the handle is never accessed).
+    _cleanup_handle: Mutex<Option<ntex::rt::JoinHandle<()>>>,
 }
 
 impl AuthCache {
@@ -197,7 +200,7 @@ impl AuthCache {
             cache,
             config,
             stats,
-            _cleanup_handle: cleanup_handle,
+            _cleanup_handle: Mutex::new(cleanup_handle),
         })
     }
 
@@ -310,11 +313,7 @@ impl AuthCache {
             total_entries,
             expired_entries: expired_count,
             valid_entries: total_entries - expired_count,
-            average_age_seconds: if total_entries > 0 {
-                total_age / total_entries
-            } else {
-                0
-            },
+            average_age_seconds: total_age.checked_div(total_entries).unwrap_or(0),
             min_age_seconds: min_age,
             max_age_seconds: max_age,
             memory_usage_estimate: total_entries as usize * std::mem::size_of::<CacheEntry>(),
@@ -524,7 +523,7 @@ mod tests {
     #[test]
     fn test_cache_entry() {
         let entry = CacheEntry::new(true, 60);
-        assert_eq!(entry.value, true);
+        assert!(entry.value);
         assert!(!entry.is_expired());
         assert_eq!(entry.access_count, 1);
     }

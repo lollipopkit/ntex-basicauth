@@ -40,6 +40,10 @@ pub enum AuthError {
     #[error("Internal server error: {0}")]
     /// Internal server error with a message
     InternalError(String),
+
+    #[error("Rate limit exceeded")]
+    /// Rate limit exceeded (too many authentication attempts)
+    RateLimited,
 }
 
 /// Authentication result type
@@ -48,6 +52,7 @@ pub type AuthResult<T> = Result<T, AuthError>;
 /// Error response structure
 #[derive(Debug)]
 #[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
+#[cfg_attr(not(feature = "json"), allow(dead_code))]
 struct AuthErrorResponse {
     code: u16,
     message: &'static str,
@@ -79,6 +84,7 @@ impl AuthError {
             AuthError::ConfigError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Configuration error"),
             AuthError::CacheError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Cache error"),
             AuthError::InternalError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Internal error"),
+            AuthError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded"),
         };
 
         let error_response = AuthErrorResponse {
@@ -108,7 +114,10 @@ impl AuthError {
 
         // Only add WWW-Authenticate header for authentication errors
         if status_code == StatusCode::UNAUTHORIZED {
-            let www_authenticate = format!("Basic realm=\"{}\", charset=\"UTF-8\"", self.escape_header_value(realm));
+            let www_authenticate = format!(
+                "Basic realm=\"{}\", charset=\"UTF-8\"",
+                self.escape_header_value(realm)
+            );
             response = response.set_header("www-authenticate", www_authenticate);
         }
 
@@ -126,21 +135,40 @@ impl AuthError {
     }
 
     #[cfg(not(feature = "json"))]
-    /// Escape JSON string
+    /// Escape JSON string (handles all control characters to prevent injection)
     fn escape_json(&self, s: &str) -> String {
-        s.replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\n', "\\n")
-            .replace('\r', "\\r")
-            .replace('\t', "\\t")
+        let mut out = String::with_capacity(s.len() + 2);
+        for c in s.chars() {
+            match c {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out
     }
 
-    /// Escape HTTP header value
+    /// Escape HTTP header value: strip control characters (CRLF injection
+    /// prevention) and escape quotes/backslashes for the quoted-string form.
     fn escape_header_value(&self, s: &str) -> String {
-        s.replace('"', "\\\"")
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                c if c.is_control() => {}
+                c => out.push(c),
+            }
+        }
+        out
     }
 
     /// Fallback JSON response (when serialization fails)
+    #[cfg(feature = "json")]
     fn fallback_json_response(&self) -> String {
         r#"{"code":500,"message":"Internal error","error":"Response serialization failed"}"#
             .to_string()
@@ -154,6 +182,7 @@ impl AuthError {
                 | AuthError::InvalidFormat
                 | AuthError::InvalidBase64
                 | AuthError::InvalidCredentials
+                | AuthError::RateLimited
         )
     }
 
@@ -169,7 +198,7 @@ impl AuthError {
             AuthError::InvalidFormat | AuthError::InvalidBase64 => "warn",
             AuthError::ValidationFailed(_) => "warn",
             AuthError::ConfigError(_) | AuthError::InternalError(_) => "error",
-            AuthError::CacheError(_) => "warn",
+            AuthError::CacheError(_) | AuthError::RateLimited => "warn",
         }
     }
 }
@@ -186,6 +215,8 @@ impl web::error::WebResponseError for AuthError {
             AuthError::ConfigError(_) | AuthError::CacheError(_) | AuthError::InternalError(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
+
+            AuthError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
         }
     }
 
@@ -243,6 +274,19 @@ mod tests {
 
         let error3 = AuthError::InvalidCredentials;
         assert_ne!(error1.error_id(), error3.error_id());
+    }
+
+    #[test]
+    fn test_escape_header_value_strips_crlf() {
+        let error = AuthError::MissingHeader;
+        // CRLF must be stripped to prevent HTTP response header injection
+        // via a crafted realm value.
+        let escaped = error.escape_header_value("safe\r\nX-Injected: evil");
+        assert!(!escaped.contains('\r'));
+        assert!(!escaped.contains('\n'));
+        // Without CRLF, "X-Injected" can no longer start a new header line;
+        // it just remains literal text inside the quoted realm value.
+        assert!(escaped.contains("X-Injected"));
     }
 
     #[cfg(not(feature = "json"))]
