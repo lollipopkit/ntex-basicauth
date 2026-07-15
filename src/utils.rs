@@ -1,6 +1,6 @@
 //! Utility functions and helper types
 
-use crate::{Credentials, BasicAuth, BasicAuthConfig, UserValidator, AuthError, AuthResult};
+use crate::{AuthError, AuthResult, BasicAuth, BasicAuthConfig, Credentials, UserValidator};
 use ntex::web::{HttpRequest, WebRequest};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -91,8 +91,8 @@ impl PathFilter {
     /// Get cached regex pattern for better performance
     #[cfg(feature = "regex")]
     fn get_cached_regex(pattern: &str) -> Result<Regex, regex::Error> {
-        let cache = REGEX_CACHE.get_or_init(|| dashmap::DashMap::new());
-        
+        let cache = REGEX_CACHE.get_or_init(dashmap::DashMap::new);
+
         if let Some(regex) = cache.get(pattern) {
             Ok(regex.clone())
         } else {
@@ -105,12 +105,14 @@ impl PathFilter {
     /// Skip authentication for regex pattern (feature disabled version)
     #[cfg(not(feature = "regex"))]
     pub fn skip_regex<P: Into<String>>(self, _pattern: P) -> Result<Self, AuthError> {
-        Err(AuthError::ConfigError("regex feature not enabled. Please use: features = [\"regex\"]".to_string()))
+        Err(AuthError::ConfigError(
+            "regex feature not enabled. Please use: features = [\"regex\"]".to_string(),
+        ))
     }
 
     /// Skip authentication for multiple exact paths
-    pub fn skip_paths<I, P>(mut self, paths: I) -> Self 
-    where 
+    pub fn skip_paths<I, P>(mut self, paths: I) -> Self
+    where
         I: IntoIterator<Item = P>,
         P: Into<String>,
     {
@@ -121,8 +123,8 @@ impl PathFilter {
     }
 
     /// Skip authentication for multiple prefixes
-    pub fn skip_prefixes<I, P>(mut self, prefixes: I) -> Self 
-    where 
+    pub fn skip_prefixes<I, P>(mut self, prefixes: I) -> Self
+    where
         I: IntoIterator<Item = P>,
         P: Into<String>,
     {
@@ -133,8 +135,8 @@ impl PathFilter {
     }
 
     /// Skip authentication for multiple suffixes
-    pub fn skip_suffixes<I, P>(mut self, suffixes: I) -> Self 
-    where 
+    pub fn skip_suffixes<I, P>(mut self, suffixes: I) -> Self
+    where
         I: IntoIterator<Item = P>,
         P: Into<String>,
     {
@@ -167,7 +169,8 @@ impl PathFilter {
 
     /// Get all exact match paths
     pub fn exact_paths(&self) -> Vec<&str> {
-        self.patterns.iter()
+        self.patterns
+            .iter()
             .filter_map(|pattern| match pattern {
                 PathPattern::Exact(path) => Some(path.as_str()),
                 _ => None,
@@ -177,7 +180,8 @@ impl PathFilter {
 
     /// Get all prefixes
     pub fn prefixes(&self) -> Vec<&str> {
-        self.patterns.iter()
+        self.patterns
+            .iter()
             .filter_map(|pattern| match pattern {
                 PathPattern::Prefix(prefix) => Some(prefix.as_str()),
                 _ => None,
@@ -193,9 +197,8 @@ impl PathFilter {
 
     /// Remove a specific exact path pattern
     pub fn remove_exact_path(mut self, path: &str) -> Self {
-        self.patterns.retain(|pattern| {
-            !matches!(pattern, PathPattern::Exact(p) if p == path)
-        });
+        self.patterns
+            .retain(|pattern| !matches!(pattern, PathPattern::Exact(p) if p == path));
         self
     }
 }
@@ -263,17 +266,16 @@ impl BasicAuthBuilder {
     }
 
     /// Add users from iterator
-    pub fn users_from_iter<I, U, P>(mut self, users: I) -> Self 
+    pub fn users_from_iter<I, U, P>(mut self, users: I) -> Self
     where
         I: IntoIterator<Item = (U, P)>,
         U: Into<String>,
         P: Into<String>,
     {
-        let mut users_map = self.users.get_or_insert_with(HashMap::new).clone();
+        let users_map = self.users.get_or_insert_with(HashMap::new);
         for (username, password) in users {
             users_map.insert(username.into(), password.into());
         }
-        self.users = Some(users_map);
         self
     }
 
@@ -281,34 +283,36 @@ impl BasicAuthBuilder {
     pub fn users_from_file<P: AsRef<std::path::Path>>(mut self, path: P) -> AuthResult<Self> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| AuthError::ConfigError(format!("Failed to read user file: {}", e)))?;
-        
-        let mut users_map = self.users.get_or_insert_with(HashMap::new).clone();
-        
+
+        let users_map = self.users.get_or_insert_with(HashMap::new);
+
         for (line_num, line) in content.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue; // Skip empty lines and comments
             }
-            
-            let colon_pos = line.find(':')
-                .ok_or_else(|| AuthError::ConfigError(
-                    format!("User file line {} format error: missing colon separator", line_num + 1)
-                ))?;
-            
+
+            let colon_pos = line.find(':').ok_or_else(|| {
+                AuthError::ConfigError(format!(
+                    "User file line {} format error: missing colon separator",
+                    line_num + 1
+                ))
+            })?;
+
             let username = line[..colon_pos].trim().to_string();
             let password = line[colon_pos + 1..].trim().to_string();
-            
+
             // Allow empty usernames per RFC 7617
             if !is_valid_username(&username) {
-                return Err(AuthError::ConfigError(
-                    format!("User file line {} format error: invalid username format", line_num + 1)
-                ));
+                return Err(AuthError::ConfigError(format!(
+                    "User file line {} format error: invalid username format",
+                    line_num + 1
+                )));
             }
-            
+
             users_map.insert(username, password);
         }
-        self.users = Some(users_map);
-        
+
         Ok(self)
     }
 
@@ -379,8 +383,8 @@ impl BasicAuthBuilder {
     }
 
     /// Configure path filter (builder pattern)
-    pub fn configure_paths<F>(mut self, configure: F) -> Self 
-    where 
+    pub fn configure_paths<F>(mut self, configure: F) -> Self
+    where
         F: FnOnce(PathFilter) -> PathFilter,
     {
         let filter = self.path_filter.take().unwrap_or_default();
@@ -389,8 +393,8 @@ impl BasicAuthBuilder {
     }
 
     /// Add skip paths (convenience)
-    pub fn skip_paths<I, P>(mut self, paths: I) -> Self 
-    where 
+    pub fn skip_paths<I, P>(mut self, paths: I) -> Self
+    where
         I: IntoIterator<Item = P>,
         P: Into<String>,
     {
@@ -455,16 +459,16 @@ impl BasicAuthBuilder {
             })
         } else {
             return Err(AuthError::ConfigError(
-                "A validator or user list must be provided".to_string()
+                "A validator or user list must be provided".to_string(),
             ));
         };
 
         let mut config = BasicAuthConfig::new(validator);
-        
+
         if let Some(realm) = self.realm {
             config = config.realm(realm);
         }
-        
+
         #[cfg(feature = "cache")]
         {
             if let Some(cache_config) = self.cache_config {
@@ -526,7 +530,7 @@ macro_rules! path_filter {
             filter
         }
     };
-    
+
     // Only prefix match
     (prefix: [$($prefix:expr),* $(,)?]) => {
         {
@@ -537,7 +541,7 @@ macro_rules! path_filter {
             filter
         }
     };
-    
+
     // Only suffix match
     (suffix: [$($suffix:expr),* $(,)?]) => {
         {
@@ -548,7 +552,7 @@ macro_rules! path_filter {
             filter
         }
     };
-    
+
     // Mixed mode
     (
         $(exact: [$($exact:expr),* $(,)?])?
@@ -558,24 +562,24 @@ macro_rules! path_filter {
     ) => {
         {
             let mut filter = $crate::PathFilter::new();
-            
+
             $($(
                 filter = filter.skip_exact($exact);
             )*)?
-            
+
             $($(
                 filter = filter.skip_prefix($prefix);
             )*)?
-            
+
             $($(
                 filter = filter.skip_suffix($suffix);
             )*)?
-            
+
             #[cfg(feature = "regex")]
             $($(
                 filter = filter.skip_regex($regex).expect("Invalid regex pattern");
             )*)?
-            
+
             filter
         }
     };
@@ -583,8 +587,7 @@ macro_rules! path_filter {
 
 /// Validate if username format is valid
 pub fn is_valid_username(username: &str) -> bool {
-    !username.contains(':') && 
-    !username.contains('\n') &&
+    !username.contains(':') && !username.contains('\n') &&
     !username.contains('\r') &&
     username.len() <= 255 && // Reasonable length limit
     username.chars().all(|c| c.is_ascii_graphic() || c == ' ')
@@ -595,31 +598,16 @@ pub fn common_skip_paths() -> PathFilter {
     PathFilter::new()
         .skip_paths([
             "/health",
-            "/healthcheck", 
+            "/healthcheck",
             "/ping",
             "/status",
             "/metrics",
-            "/favicon.ico"
+            "/favicon.ico",
         ])
-        .skip_prefixes([
-            "/static/",
-            "/assets/",
-            "/public/",
-            "/.well-known/"
-        ])
+        .skip_prefixes(["/static/", "/assets/", "/public/", "/.well-known/"])
         .skip_suffixes([
-            ".css",
-            ".js",
-            ".png",
-            ".jpg",
-            ".jpeg",
-            ".gif",
-            ".ico",
-            ".svg",
-            ".woff",
-            ".woff2",
-            ".ttf",
-            ".eot"
+            ".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".woff", ".woff2",
+            ".ttf", ".eot",
         ])
 }
 
@@ -679,7 +667,7 @@ mod tests {
     #[test]
     fn test_common_skip_paths() {
         let filter = common_skip_paths();
-        
+
         assert!(filter.should_skip("/health"));
         assert!(filter.should_skip("/static/css/main.css"));
         assert!(filter.should_skip("/favicon.ico"));
@@ -693,7 +681,7 @@ mod tests {
         assert!(is_valid_username("admin"));
         assert!(is_valid_username("user123"));
         assert!(is_valid_username("test user")); // contains space
-        
+
         // Now allows empty username per RFC 7617
         assert!(is_valid_username(""));
         assert!(!is_valid_username("user:name")); // contains colon
@@ -704,26 +692,25 @@ mod tests {
     #[test]
     fn test_builder_from_file() -> std::io::Result<()> {
         use std::io::Write;
-        
+
         // Create temporary file
         let mut temp_file = tempfile::NamedTempFile::new()?;
         writeln!(temp_file, "# This is a comment")?;
         writeln!(temp_file, "admin:secret")?;
         writeln!(temp_file, "user:password:with:colons")?;
-        writeln!(temp_file, "")?; // empty line
+        writeln!(temp_file)?; // empty line
         writeln!(temp_file, "guest:guest123")?;
-        
+
         let builder = BasicAuthBuilder::new()
             .users_from_file(temp_file.path())
             .expect("Failed to load users from file");
-        
+
         let auth = builder.build().expect("Failed to build authentication");
-        
+
         // Verify users are loaded correctly
         let validator = auth.config.validator.as_ref();
-        dbg!("User validator: {:?}", validator);
         assert_eq!(validator.user_count(), 3);
-        
+
         Ok(())
     }
 
@@ -732,12 +719,12 @@ mod tests {
         let filter = PathFilter::new()
             .skip_exact("/health")
             .skip_exact("/status");
-        
+
         assert_eq!(filter.pattern_count(), 2);
-        
+
         let filter = filter.remove_exact_path("/health");
         assert_eq!(filter.pattern_count(), 1);
-        
+
         let filter = filter.clear();
         assert_eq!(filter.pattern_count(), 0);
         assert!(filter.is_empty());

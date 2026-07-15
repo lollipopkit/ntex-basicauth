@@ -3,8 +3,10 @@
 use crate::{
     error::{AuthError, AuthResult},
     is_valid_username,
+    limiter::{ConcurrencyLimiter, RateLimiter},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
+use ntex::time::timeout;
 use ntex::{Middleware, Service, ServiceCtx, web};
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -55,16 +57,24 @@ impl Credentials {
         hasher.finalize().into()
     }
 
-    /// Enhanced timing-safe password verification to prevent timing attacks
+    /// Timing-safe password verification.
+    ///
+    /// Both passwords are reduced to fixed-length SHA-256 digests before the
+    /// constant-time comparison, so the comparison always runs over equal-length
+    /// buffers and does not leak whether the plaintext lengths match (a raw
+    /// `ct_eq` skips comparison on length mismatch, leaking that information).
     #[cfg(feature = "timing-safe")]
     pub fn verify_password(&self, expected: &str) -> bool {
-        // Ensure both strings have the same length before comparison
-        if self.password.len() != expected.len() {
-            // Execute a dummy comparison to maintain timing consistency
-            let _ = b"dummy_password_123".ct_eq(b"dummy_password_123");
-            return false;
-        }
-        self.password.as_bytes().ct_eq(expected.as_bytes()).into()
+        use sha2::{Digest, Sha256};
+
+        let mut ha = Sha256::new();
+        ha.update(self.password.as_bytes());
+        let mut hb = Sha256::new();
+        hb.update(expected.as_bytes());
+
+        let a = ha.finalize();
+        let b = hb.finalize();
+        a.as_slice().ct_eq(b.as_slice()).into()
     }
 
     /// Non-timing-safe password verification (fallback if timing-safe feature is off)
@@ -418,6 +428,9 @@ impl AuthMetrics {
     }
 }
 
+/// Custom error handler type for authentication failures
+pub type CustomErrorHandler = Arc<dyn Fn(&AuthError, &str) -> web::HttpResponse + Send + Sync>;
+
 /// Basic authentication config
 pub struct BasicAuthConfig {
     /// Authentication realm (for WWW-Authenticate header)
@@ -434,8 +447,7 @@ pub struct BasicAuthConfig {
     /// Log details on authentication failure
     pub log_failures: bool,
     /// Custom error handler
-    pub custom_error_handler:
-        Option<Arc<dyn Fn(&AuthError, &str) -> web::HttpResponse + Send + Sync>>,
+    pub custom_error_handler: Option<CustomErrorHandler>,
     /// Maximum concurrent authentication validations
     pub max_concurrent_validations: Option<usize>,
     /// Validation timeout
@@ -622,15 +634,25 @@ impl BasicAuthConfig {
 pub struct BasicAuth {
     pub(crate) config: BasicAuthConfig,
     pub(crate) metrics: Arc<AuthMetrics>,
+    pub(crate) concurrency_limiter: Option<Arc<ConcurrencyLimiter>>,
+    pub(crate) rate_limiter: Option<Arc<RateLimiter>>,
 }
 
 impl BasicAuth {
     /// Create new BasicAuth instance
     pub fn new(config: BasicAuthConfig) -> AuthResult<Self> {
         config.validate()?;
+        let concurrency_limiter = config
+            .max_concurrent_validations
+            .map(|max| Arc::new(ConcurrencyLimiter::new(max)));
+        let rate_limiter = config
+            .rate_limit_per_ip
+            .map(|(max_requests, window)| Arc::new(RateLimiter::new(max_requests, window)));
         Ok(Self {
             config,
             metrics: Arc::new(AuthMetrics::new()),
+            concurrency_limiter,
+            rate_limiter,
         })
     }
 
@@ -660,11 +682,9 @@ impl BasicAuth {
             return Err(AuthError::InvalidFormat);
         }
 
-        if auth_header.len() < 6 {
-            return Err(AuthError::InvalidFormat);
-        }
-
-        let scheme = &auth_header[..6];
+        // Safe slicing: `get(..6)` returns None when the cut is not on a UTF-8
+        // boundary, which prevents a panic on malformed non-ASCII headers.
+        let scheme = auth_header.get(..6).ok_or(AuthError::InvalidFormat)?;
         if !scheme.eq_ignore_ascii_case("Basic ") {
             return Err(AuthError::InvalidFormat);
         }
@@ -680,15 +700,15 @@ impl BasicAuth {
             .decode(encoded)
             .map_err(|_| AuthError::InvalidBase64)?;
 
-        let decoded_str = String::from_utf8(decoded).map_err(|_| AuthError::InvalidBase64)?;
+        // Validate UTF-8 without an intermediate String allocation
+        let decoded_str = std::str::from_utf8(&decoded).map_err(|_| AuthError::InvalidBase64)?;
 
         // Split only at the first colon, support colons in password
-        let colon_pos = decoded_str.find(':').ok_or(AuthError::InvalidFormat)?;
+        let (username, password) = decoded_str
+            .split_once(':')
+            .ok_or(AuthError::InvalidFormat)?;
 
-        let username = decoded_str[..colon_pos].to_string();
-        let password = decoded_str[colon_pos + 1..].to_string();
-
-        let credentials = Credentials::new(username, password);
+        let credentials = Credentials::new(username.to_string(), password.to_string());
 
         // Validate credentials format
         if !credentials.is_valid_format() {
@@ -716,9 +736,7 @@ impl BasicAuth {
                 }
 
                 let start = Instant::now();
-
-                // Validate using configured validator
-                let result = self.config.validator.validate(credentials).await?;
+                let result = self.run_validation(credentials).await?;
 
                 if self.config.enable_metrics {
                     self.metrics.add_validation_time(start.elapsed());
@@ -736,12 +754,32 @@ impl BasicAuth {
 
         // Validate using configured validator (when cache is disabled)
         let start = Instant::now();
-        let result = self.config.validator.validate(credentials).await?;
+        let result = self.run_validation(credentials).await?;
 
         if self.config.enable_metrics {
             self.metrics.add_validation_time(start.elapsed());
         }
         Ok(result)
+    }
+
+    /// Run the configured validator, applying the optional concurrency limit
+    /// and validation timeout. The concurrency permit is held for the duration
+    /// of the validation and released on early return or timeout via `Drop`.
+    async fn run_validation(&self, credentials: &Credentials) -> AuthResult<bool> {
+        let _permit = if let Some(limiter) = &self.concurrency_limiter {
+            Some(limiter.acquire().await)
+        } else {
+            None
+        };
+
+        let validate = self.config.validator.validate(credentials);
+        if let Some(timeout_dur) = self.config.validation_timeout {
+            timeout(timeout_dur, validate)
+                .await
+                .map_err(|_| AuthError::InternalError("Validation timed out".to_string()))?
+        } else {
+            validate.await
+        }
     }
 
     /// Handle authentication error
@@ -772,10 +810,10 @@ impl BasicAuth {
     }
 }
 
-impl<S> Middleware<S> for BasicAuth {
+impl<S, Cfg> Middleware<S, Cfg> for BasicAuth {
     type Service = BasicAuthMiddlewareService<S>;
 
-    fn create(&self, service: S) -> Self::Service {
+    fn create(&self, service: S, _cfg: Cfg) -> Self::Service {
         BasicAuthMiddlewareService {
             service,
             auth: BasicAuth {
@@ -795,6 +833,8 @@ impl<S> Middleware<S> for BasicAuth {
                     log_usernames_in_production: self.config.log_usernames_in_production,
                 },
                 metrics: Arc::clone(&self.metrics),
+                concurrency_limiter: self.concurrency_limiter.clone(),
+                rate_limiter: self.rate_limiter.clone(),
             },
         }
     }
@@ -821,14 +861,30 @@ where
         let metrics_enabled = self.auth.config.enable_metrics;
 
         // Check if path filter is configured and should skip authentication
-        if let Some(filter) = &self.auth.config.path_filter {
-            if filter.should_skip(req.path()) {
-                return ctx.call(&self.service, req).await;
-            }
+        if let Some(filter) = &self.auth.config.path_filter
+            && filter.should_skip(req.path())
+        {
+            return ctx.call(&self.service, req).await;
         }
 
         if metrics_enabled {
             self.auth.metrics.incr_total_requests();
+        }
+
+        // Per-IP rate limiting (checked before credential parsing)
+        if let Some(rate_limiter) = &self.auth.rate_limiter {
+            let ip = req
+                .peer_addr()
+                .map(|addr| addr.ip().to_string())
+                .unwrap_or_default();
+            if let Err(err) = rate_limiter.check(&ip) {
+                self.auth.log_auth_failure(&err, None);
+                let response = self.auth.handle_auth_error(&err);
+                if metrics_enabled {
+                    self.auth.metrics.incr_failed_auths();
+                }
+                return Ok(req.into_response(response));
+            }
         }
 
         // Extract authorization header
@@ -936,6 +992,16 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_credentials_multibyte_no_panic() {
+        // "abc" + a 4-byte emoji: byte index 6 falls inside the emoji, which
+        // previously caused `&auth_header[..6]` to panic. Must be rejected
+        // gracefully instead of crashing the worker (DoS).
+        let malicious = "abc😀garbage";
+        let result = BasicAuth::parse_credentials(malicious, 8192);
+        assert!(matches!(result, Err(AuthError::InvalidFormat)));
+    }
+
+    #[test]
     fn test_credentials_validation() {
         let valid_creds = Credentials::new("user".to_string(), "pass".to_string());
         let valid_empty_user = Credentials::new("".to_string(), "pass".to_string()); // Now valid per RFC 7617
@@ -1009,5 +1075,90 @@ mod tests {
 
         assert!(validator.validate(&valid_creds).await.unwrap());
         assert!(!validator.validate(&invalid_creds).await.unwrap());
+    }
+
+    #[ntex::test]
+    async fn test_rate_limit_per_ip() {
+        use base64::Engine;
+        use std::time::Duration;
+
+        let auth = crate::BasicAuthBuilder::new()
+            .user("admin", "secret")
+            .rate_limit_per_ip(1, Duration::from_secs(60))
+            .build()
+            .unwrap();
+        let app = ntex::web::test::init_service(
+            ntex::web::App::new()
+                .middleware(auth)
+                .route("/", ntex::web::get().to(|| async { "ok" })),
+        )
+        .await;
+
+        let auth_hdr = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("admin:secret")
+        );
+        let ip: std::net::SocketAddr = "1.2.3.4:80".parse().unwrap();
+
+        // First request from this IP succeeds.
+        let req = ntex::web::test::TestRequest::get()
+            .peer_addr(ip)
+            .header("authorization", auth_hdr.as_str())
+            .to_request();
+        let resp = ntex::web::test::call_service(&app, req).await;
+        assert!(resp.status().is_success());
+
+        // Second request from the same IP exceeds the limit (1 req / 60s).
+        let req = ntex::web::test::TestRequest::get()
+            .peer_addr(ip)
+            .header("authorization", auth_hdr.as_str())
+            .to_request();
+        let resp = ntex::web::test::call_service(&app, req).await;
+        assert_eq!(resp.status(), ntex::http::StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[ntex::test]
+    async fn test_validation_timeout() {
+        use base64::Engine;
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        #[derive(Debug)]
+        struct SlowValidator;
+
+        impl UserValidator for SlowValidator {
+            fn validate<'a>(
+                &'a self,
+                _: &'a Credentials,
+            ) -> Pin<Box<dyn Future<Output = AuthResult<bool>> + Send + 'a>> {
+                Box::pin(async {
+                    ntex::time::sleep(Duration::from_secs(5)).await;
+                    Ok(true)
+                })
+            }
+        }
+
+        let validator = Arc::new(SlowValidator);
+        let config = BasicAuthConfig::new(validator).validation_timeout(Duration::from_millis(100));
+        let auth = BasicAuth::new(config).unwrap();
+        let app = ntex::web::test::init_service(
+            ntex::web::App::new()
+                .middleware(auth)
+                .route("/", ntex::web::get().to(|| async { "ok" })),
+        )
+        .await;
+
+        let auth_hdr = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("admin:secret")
+        );
+        let req = ntex::web::test::TestRequest::get()
+            .header("authorization", auth_hdr.as_str())
+            .to_request();
+        let resp = ntex::web::test::call_service(&app, req).await;
+        // Validation timed out -> InternalError (500).
+        assert_eq!(resp.status(), ntex::http::StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

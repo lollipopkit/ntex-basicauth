@@ -16,18 +16,18 @@ json = ["dep:serde", "dep:serde_json"]
 bcrypt = ["dep:bcrypt"]
 cache = ["dep:sha2", "dep:dashmap"]
 regex = ["dep:regex"]
-timing-safe = ["dep:subtle"]
+timing-safe = ["dep:subtle", "dep:sha2"]
 secure-memory = ["dep:zeroize"]
 
 [dependencies]
-base64 = "0"
+base64 = "0.22"
 dashmap = { version = "6", optional = true }
-ntex = "2"
+ntex = "3"
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
-bcrypt = { version = "0", optional = true }
-thiserror = "1"
-sha2 = { version = "0", optional = true }
+bcrypt = { version = "0.19", optional = true }
+thiserror = "2"
+sha2 = { version = "0.11", optional = true }
 regex = { version = "1", optional = true }
 subtle = { version = "2", optional = true } # For timing-safe comparisons
 zeroize = { version = "1", features = [
@@ -36,7 +36,7 @@ zeroize = { version = "1", features = [
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "macros", "rt"] }
-ntex = { version = "2", features = ["tokio"] }
+ntex = { version = "3", features = ["tokio"] }
 tempfile = "3"
 
 [package.metadata.docs.rs]
