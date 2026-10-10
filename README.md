@@ -1,332 +1,137 @@
 # ntex-basicauth
 
-A Basic Authentication middleware for the [ntex](https://github.com/ntex-rs/ntex) web framework.
+Basic Authentication (RFC 7617) middleware for the [ntex](https://github.com/ntex-rs/ntex) web framework.
 
 [![Crates.io](https://img.shields.io/crates/v/ntex-basicauth.svg)](https://crates.io/crates/ntex-basicauth)
 [![Documentation](https://docs.rs/ntex-basicauth/badge.svg)](https://docs.rs/ntex-basicauth)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-2024%2B-orange.svg)](https://www.rust-lang.org/)
 
 ## Features
 
-- **Cache** - Built-in authentication result cache to reduce validation overhead
-- **Flexible Configuration** - Supports multiple user validation methods
-- **Path Filtering** - Supports skipping authentication for specific paths
-- **BCrypt Support** - BCrypt password hashing (enabled by default, disable with `default-features = false`)
-- **JSON Response** - Optional JSON error response (requires `json` feature)
-- **Custom Validator** - Support for custom user validation logic
-- **Regex Paths** - Regular expression path matching (requires `regex` feature)
-- **Safety** - Timing-safe password comparison (`timing-safe`, enabled by default). Automatic password memory cleanup using `zeroize` crate (`secure-memory`, enabled by default)
+- Static user list (stored as SHA-256 digests, constant-time comparison), BCrypt, or a custom async validator
+- Per-IP limit of failed attempts, validation timeout and concurrency limit
+- Optional cache of successful authentications
+- Path filter to skip authentication (exact / prefix / suffix / regex)
+- `AuthenticatedUser` extractor for handlers
+- Passwords are zeroized after use and redacted from `Debug`; error responses never expose internal details
 
-## Installation
-
-Add the dependency in your `Cargo.toml`:
-
-```toml
-[dependencies]
-ntex-basicauth = "0"
-```
-
-Enable optional features if needed:
-
-```toml
-[dependencies]
-ntex-basicauth = { version = "0", features = ["bcrypt", "regex"] }
-```
+| Feature  | Default | Description                                  |
+| -------- | ------- | -------------------------------------------- |
+| `cache`  | yes     | Cache of successful authentications          |
+| `regex`  | yes     | `PathFilter::skip_regex`                     |
+| `bcrypt` | yes     | `BcryptUserValidator`                        |
 
 ## Quick Start
 
-### Basic Usage
-
-```rust
+```rust,no_run
 use ntex::web;
-use ntex_basicauth::BasicAuthBuilder;
-use std::collections::HashMap;
+use ntex_basicauth::{AuthenticatedUser, BasicAuth, common_skip_paths};
 
 #[ntex::main]
 async fn main() -> std::io::Result<()> {
+    // Build once and clone into each worker so that the failure limiter,
+    // cache and metrics are shared.
+    let auth = BasicAuth::builder()
+        .user("admin", "secret")
+        .realm("My Application")
+        .path_filter(common_skip_paths())
+        .build()
+        .expect("invalid auth config");
 
-    web::HttpServer::new(move || {
-        let mut users = HashMap::new();
-        users.insert("admin".to_string(), "secret".to_string());
-        users.insert("user".to_string(), "password".to_string());
-
-        let auth = BasicAuthBuilder::new()
-            .users(users)
-            .realm("My Application")
-            .build()
-            .expect("Failed to configure authentication");
-
+    web::HttpServer::new(async move || {
         web::App::new()
-            .route(
-                web::scope("/protected")
-                    .middleware(auth)
-                    .route("/", web::get().to(protected_handler)),
-            )
-            .route("/public", web::get().to(public_handler))
+            .middleware(auth.clone())
+            .route("/", web::get().to(index))
     })
     .bind("127.0.0.1:8080")?
     .run()
     .await
 }
 
-async fn protected_handler() -> &'static str {
-    "This is protected content!"
-}
-
-async fn public_handler() -> &'static str {
-    "This is public content"
+// Use `Option<AuthenticatedUser>` on routes that may skip authentication.
+async fn index(user: AuthenticatedUser) -> String {
+    format!("Hello, {}!", user.username())
 }
 ```
 
-### Using the Builder Pattern
+## Configuration
+
+```rust,no_run
+use ntex_basicauth::{AuthResult, BasicAuth, CacheConfig, PathFilter};
+use std::time::Duration;
+
+fn auth() -> AuthResult<BasicAuth> {
+    BasicAuth::builder()
+        .users_from_file("users.txt")?              // `username:password` per line
+        .realm("Production API")
+        .cache(CacheConfig::new().max_size(1000).ttl(Duration::from_secs(300)))
+        .max_failures_per_ip(10, Duration::from_secs(60)) // 429 after 10 failures/min
+        .trusted_proxies(["10.0.0.0/8".parse().unwrap()]) // read X-Forwarded-For from these
+        .max_concurrent_validations(100)
+        .validation_timeout(Duration::from_secs(5)) // 503 on timeout
+        .log_failures(true)
+        .path_filter(PathFilter::new().skip_exact("/health").skip_prefix("/static/"))
+        .build()
+}
+```
+
+Notes:
+
+- `max_failures_per_ip` only counts failed attempts (wrong credentials or a malformed header); successful requests are never throttled. Blocked clients get 429 with `Retry-After`. IPv6 clients are grouped by /64.
+- The client IP is the peer address. `X-Forwarded-For` is read only when the peer is in `trusted_proxies`, taking the rightmost hop that is not a trusted proxy (hops a client prepends are ignored). Behind an unlisted proxy, all clients share the proxy's failure budget.
+- Requests without a peer address (Unix sockets) share one failure budget by default. Behind a local reverse proxy on a Unix socket, enable `trust_peerless_proxy(true)` to key them by `X-Forwarded-For` instead.
+- At most 65536 clients are tracked; beyond that, new clients share the same overflow entry.
+- The cache only stores successful authentications. Call `BasicAuth::clear_cache()` after changing passwords in a custom backend.
+- `skip_suffix` matches any route ending with the suffix (including dynamic segments such as `/api/users/x.js`); prefer prefixes. Paths with dot-segments (`..`, `%2e%2e`) never skip authentication.
+
+## Validators
+
+### BCrypt
 
 ```rust
-use ntex_basicauth::{BasicAuthBuilder, PathFilter};
-use std::collections::HashMap;
+use ntex_basicauth::{AuthResult, BasicAuth, BcryptUserValidator};
 
-let mut users = HashMap::new();
-users.insert("admin".to_string(), "secret".to_string());
-
-let filter = PathFilter::new()
-    .skip_prefix("/public/")
-    .skip_exact("/health")
-    .skip_suffix(".css");
-
-let auth = BasicAuthBuilder::new()
-    .users(users)
-    .realm("My Application")
-    .path_filter(filter)
-    .log_failures(true)
-    .max_header_size(4096)
-    .build()
-    .unwrap();
+fn auth() -> AuthResult<BasicAuth> {
+    let mut validator = BcryptUserValidator::new();
+    validator.add_user("admin", "$2b$12$...");
+    BasicAuth::builder().validator(validator).build()
+}
 ```
 
-### Regex Path Filtering
-
-Enable the `regex` feature in Cargo.toml:
-
-```toml
-[dependencies]
-ntex-basicauth = { version = "0", features = ["regex"] }
-```
+### Custom
 
 ```rust
-use ntex_basicauth::{BasicAuthBuilder, PathFilter};
+use ntex_basicauth::{AuthResult, BasicAuth, BoxFuture, Credentials, UserValidator};
 
-let filter = PathFilter::new()
-    .skip_regex(r"^/assets/.*\.(js|css|png|jpg)$").unwrap();
+struct DbValidator;
 
-let auth = BasicAuthBuilder::new()
-    .user("admin", "secret")
-    .path_filter(filter)
-    .build()
-    .unwrap();
-```
-
-### BCrypt Password Support
-
-Enable the `bcrypt` feature in Cargo.toml:
-
-```toml
-[dependencies]
-ntex-basicauth = { version = "0", features = ["bcrypt"] }
-```
-
-```rust
-use ntex_basicauth::{BasicAuthBuilder, BcryptUserValidator};
-use std::sync::Arc;
-
-let mut validator = BcryptUserValidator::new();
-validator.add_user_with_password("admin".to_string(), "secret").unwrap();
-
-let auth = BasicAuthBuilder::new()
-    .validator(Arc::new(validator))
-    .realm("My Application")
-    .build()
-    .unwrap();
-```
-
-### Custom Validator
-
-```rust
-use ntex_basicauth::{UserValidator, Credentials, AuthResult, BasicAuthBuilder};
-use std::sync::Arc;
-use std::future::Future;
-use std::pin::Pin;
-
-struct DatabaseValidator;
-
-impl UserValidator for DatabaseValidator {
-    fn validate<'a>(
-        &'a self,
-        credentials: &'a Credentials,
-    ) -> Pin<Box<dyn Future<Output = AuthResult<bool>> + Send + 'a>> {
+impl UserValidator for DbValidator {
+    fn validate<'a>(&'a self, credentials: &'a Credentials) -> BoxFuture<'a, AuthResult<bool>> {
         Box::pin(async move {
-            // Replace with your DB logic
-            Ok(credentials.username == "admin" && credentials.password == "secret")
+            // Ok(false) for wrong credentials (401), Err for backend failures (500).
+            Ok(credentials.username == "admin" && credentials.verify_password("secret"))
         })
     }
 }
 
-let auth = BasicAuthBuilder::new()
-    .validator(Arc::new(DatabaseValidator))
-    .realm("Custom Realm")
-    .build()
-    .unwrap();
-```
-
-## Getting User Information
-
-Get authenticated user information in the request handler:
-
-```rust
-use ntex::web;
-use ntex_basicauth::{extract_credentials, get_username, is_user};
-
-async fn handler(req: web::HttpRequest) -> web::Result<String> {
-    if let Some(credentials) = extract_credentials(&req) {
-        return Ok(format!("User: {}", credentials.username));
-    }
-
-    if let Some(username) = get_username(&req) {
-        return Ok(format!("Welcome, {}!", username));
-    }
-
-    if is_user(&req, "admin") {
-        return Ok("Admin access granted".to_string());
-    }
-
-    Ok("Unknown user".to_string())
+fn auth() -> AuthResult<BasicAuth> {
+    BasicAuth::builder().validator(DbValidator).build()
 }
 ```
 
-## PathFilter Builder Pattern
+## Errors
 
-You can use the `PathFilter` builder for convenient filter creation:
+| Error                | Status | Body message               |
+| -------------------- | ------ | -------------------------- |
+| `MissingHeader`      | 401    | `Authentication required`  |
+| `InvalidHeader`      | 401    | `Authentication required`  |
+| `InvalidCredentials` | 401    | `Invalid credentials`      |
+| `RateLimited`        | 429    | `Too many failed attempts` |
+| `Timeout`            | 503    | `Authentication timed out` |
+| `Validator`/`Config` | 500    | `Internal server error`    |
 
-```rust
-use ntex_basicauth::PathFilter;
-
-let filter = PathFilter::new()
-    .skip_exact("/health")
-    .skip_exact("/metrics")
-    .skip_prefix("/public/")
-    .skip_suffix(".css")
-    .skip_suffix(".js");
-```
-
-## Common Skip Paths
-
-Use built-in common skip paths for typical web applications (health checks, static assets, etc.):
-
-```rust
-use ntex_basicauth::{BasicAuthBuilder, PathFilter};
-
-// Create a filter with common web paths
-let common_filter = PathFilter::new()
-    .skip_exact("/health")
-    .skip_exact("/metrics")
-    .skip_exact("/favicon.ico")
-    .skip_prefix("/static/")
-    .skip_prefix("/assets/")
-    .skip_suffix(".css")
-    .skip_suffix(".js")
-    .skip_suffix(".png")
-    .skip_suffix(".jpg")
-    .skip_suffix(".ico");
-
-let auth = BasicAuthBuilder::new()
-    .user("admin", "secret")
-    .path_filter(common_filter)
-    .build()
-    .unwrap();
-```
-
-## Error Handling
-
-When authentication fails, the middleware returns HTTP 401 status code and corresponding error information:
-
-```json
-{
-    "code": 401,
-    "message": "Authentication required",
-    "error": "Invalid credentials"
-}
-```
-
-Error types include:
-
-- `MissingHeader` - Missing Authorization header
-- `InvalidFormat` - Invalid Authorization header format
-- `InvalidBase64` - Invalid Base64 encoding
-- `InvalidCredentials` - Invalid user credentials
-- `ValidationFailed` - User validation failed
-
-## Configuration
-
-### Advanced Security Configuration
-
-```rust
-use ntex_basicauth::{BasicAuthBuilder, CacheConfig, PathFilter};
-use std::time::Duration;
-
-// Production-ready configuration with security hardening
-let cache_config = CacheConfig::new()
-    .max_size(1000)
-    .ttl_minutes(10)
-    .cleanup_interval_seconds(300);
-
-// Common paths to skip authentication
-let skip_paths = PathFilter::new()
-    .skip_exact("/health")
-    .skip_exact("/metrics")
-    .skip_prefix("/static/")
-    .skip_suffix(".css")
-    .skip_suffix(".js");
-
-let auth = BasicAuthBuilder::new()
-    .users_from_file("users.txt")           // Load users from file
-    .realm("Production API")
-    .with_cache(cache_config)
-    .max_concurrent_validations(100)        // Prevent resource exhaustion
-    .validation_timeout(Duration::from_secs(30))
-    .rate_limit_per_ip(10, Duration::from_secs(60))  // 10 req/min per IP
-    .log_usernames_in_production(false)     // Security: no username logging
-    .path_filter(skip_paths)                // Skip health checks, assets
-    .build()
-    .unwrap();
-```
-
-### Security Best Practices
-
-- **Memory Security**: The `secure-memory` feature (enabled by default) automatically clears password data from memory after use
-- **Cache Security**: Cache keys are SHA256-hashed with application-specific salt to prevent rainbow table attacks
-- **Production Logging**: Set `log_usernames_in_production(false)` to prevent username leakage in production logs
-- **DoS Protection**: Configure rate limiting and concurrent validation limits to prevent resource exhaustion
-
-## Cache Configuration
-
-Cache is enabled by default (unless disabled via builder/config):
-
-```rust
-use ntex_basicauth::{BasicAuthBuilder, CacheConfig};
-
-// High-traffic configuration
-let cache_config = CacheConfig::new()
-    .max_size(10000)                    // Large cache for busy servers
-    .ttl_minutes(5)                     // Short TTL for security
-    .cleanup_interval_seconds(60)       // Frequent cleanup
-    .enable_stats(true);                // Monitor cache performance
-
-let auth = BasicAuthBuilder::new()
-    .user("admin", "secret")
-    .with_cache(cache_config)
-    .build()
-    .unwrap();
-```
+Body format: `{"code":401,"message":"Invalid credentials"}`. Use `BasicAuthBuilder::error_handler` to customize the response.
 
 ## License
 
-Licensed under the MIT License. See [LICENSE](LICENSE) for details.
+MIT
