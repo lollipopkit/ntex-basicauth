@@ -36,7 +36,8 @@
 //!
 //! ## Feature Flags
 //!
-//! - `cache` (default): cache of successful authentications
+//! - `cache` (default): cache of successful authentications, enabled by
+//!   default in [`BasicAuthBuilder`]
 //! - `regex` (default): regex path matching in [`PathFilter`]
 //! - `bcrypt` (default): [`BcryptUserValidator`]
 

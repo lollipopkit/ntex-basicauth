@@ -35,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   requires `Debug`. `pre_validate`, `name` and `user_count` are removed.
 - `CacheConfig` only has `max_size` and `ttl`; `AuthCache`, `CacheStats` and
   the background cleanup task are removed. `BasicAuth::clear_cache` is new.
+- The cache is enabled by default (`CacheConfig::default()`); `with_cache` /
+  `disable_cache` are replaced by `cache(impl Into<Option<CacheConfig>>)`,
+  `cache(None)` disables it.
 - `AuthMetrics` fields are private; validation time is measured in
   microseconds and averaged over validator calls (`avg_validation_time`).
 - `ConcurrencyLimiter` and `RateLimiter` are no longer public.

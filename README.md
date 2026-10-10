@@ -10,7 +10,7 @@ Basic Authentication (RFC 7617) middleware for the [ntex](https://github.com/nte
 
 - Static user list (stored as SHA-256 digests, constant-time comparison), BCrypt, or a custom async validator
 - Per-IP limit of failed attempts, validation timeout and concurrency limit
-- Optional cache of successful authentications
+- Cache of successful authentications (enabled by default)
 - Path filter to skip authentication (exact / prefix / suffix / regex)
 - `AuthenticatedUser` extractor for handlers
 - Passwords are zeroized after use and redacted from `Debug`; error responses never expose internal details
@@ -77,11 +77,11 @@ fn auth() -> AuthResult<BasicAuth> {
 
 Notes:
 
-- `max_failures_per_ip` only counts failed attempts (wrong credentials or a malformed header); successful requests are never throttled. Attempts still being validated count against the budget, so parallel requests cannot exceed it (enable the cache with slow validators). Blocked clients get 429 with `Retry-After`. IPv6 clients are grouped by /64.
+- `max_failures_per_ip` only counts failed attempts (wrong credentials or a malformed header); successful requests are never throttled. Attempts still being validated count against the budget, so parallel requests cannot exceed it (keep the cache enabled with slow validators). Blocked clients get 429 with `Retry-After`. IPv6 clients are grouped by /64.
 - The client IP is the peer address. `X-Forwarded-For` is read only when the peer is in `trusted_proxies`, taking the rightmost hop that is not a trusted proxy (hops a client prepends are ignored). Behind an unlisted proxy, all clients share the proxy's failure budget.
 - Requests without a peer address (Unix sockets) share one failure budget by default. Behind a local reverse proxy on a Unix socket, enable `trust_peerless_proxy(true)` to key them by `X-Forwarded-For` instead.
 - At most 65536 clients are tracked; beyond that, new clients share the same overflow entry.
-- The cache only stores successful authentications. Call `BasicAuth::clear_cache()` after changing passwords in a custom backend.
+- The cache is enabled by default (1000 entries, 5 minutes TTL) and only stores successful authentications. Disable it with `.cache(None)`; call `BasicAuth::clear_cache()` after changing passwords in a custom backend.
 - `skip_suffix` matches any route ending with the suffix (including dynamic segments such as `/api/users/x.js`); prefer prefixes. Paths with dot-segments (`..`, `%2e%2e`) never skip authentication.
 
 ## Validators

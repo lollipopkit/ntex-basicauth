@@ -434,7 +434,7 @@ impl Default for BasicAuthBuilder {
             case_sensitive: true,
             realm: DEFAULT_REALM.into(),
             #[cfg(feature = "cache")]
-            cache: None,
+            cache: Some(CacheConfig::default()),
             path_filter: None,
             max_header_size: 8192,
             log_failures: false,
@@ -511,10 +511,13 @@ impl BasicAuthBuilder {
         self
     }
 
-    /// Cache successful authentications (disabled by default)
+    /// Cache of successful authentications, `None` to disable (default:
+    /// [`CacheConfig::default`]). A cached login stays valid until it expires,
+    /// even if a custom validator's backend changes the password meanwhile;
+    /// call [`BasicAuth::clear_cache`] after such changes.
     #[cfg(feature = "cache")]
-    pub fn cache(mut self, config: CacheConfig) -> Self {
-        self.cache = Some(config);
+    pub fn cache(mut self, config: impl Into<Option<CacheConfig>>) -> Self {
+        self.cache = config.into();
         self
     }
 
@@ -582,9 +585,9 @@ impl BasicAuthBuilder {
     ///
     /// Attempts still being validated count against the budget, so concurrent
     /// requests cannot exceed it; once failures plus attempts in flight reach
-    /// `max`, further requests get 429 with `Retry-After: 1`. With a slow
-    /// validator, enable the cache so that parallel requests of a logged-in
-    /// client are answered from it.
+    /// `max`, further requests get 429 with `Retry-After: 1`. Keep the cache
+    /// enabled with a slow validator, so that parallel requests of a
+    /// logged-in client are answered from it.
     pub fn max_failures_per_ip(mut self, max: u32, window: Duration) -> Self {
         self.max_failures_per_ip = Some((max, window));
         self
@@ -940,6 +943,19 @@ mod tests {
         assert_eq!(auth.0.cache.as_ref().unwrap().len(), 1);
         auth.clear_cache();
         assert_eq!(auth.0.cache.as_ref().unwrap().len(), 0);
+    }
+
+    #[cfg(feature = "cache")]
+    #[test]
+    fn cache_enabled_by_default() {
+        let auth = BasicAuth::builder().user("a", "b").build().unwrap();
+        assert!(auth.0.cache.is_some());
+        let auth = BasicAuth::builder()
+            .user("a", "b")
+            .cache(None)
+            .build()
+            .unwrap();
+        assert!(auth.0.cache.is_none());
     }
 
     #[ntex::test]
