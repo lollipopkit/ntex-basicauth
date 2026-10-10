@@ -5,8 +5,10 @@ use regex::Regex;
 
 /// Set of path patterns that skip authentication.
 ///
-/// Paths containing dot-segments (`.`, `..`, or their percent-encoded forms)
-/// never match, so `/static/../admin` cannot be used to bypass authentication.
+/// Paths that a later component could resolve differently never match:
+/// dot-segments (`..`, `%2e%2e`), encoded separators (`%2f`, `%5c`),
+/// backslashes and double encoding (`%25`). So neither `/static/../admin` nor
+/// `/static/%2e%2e%2fadmin` can be used to bypass authentication.
 #[derive(Debug, Clone, Default)]
 pub struct PathFilter {
     patterns: Vec<PathPattern>,
@@ -72,7 +74,7 @@ impl PathFilter {
 
     /// Whether `path` skips authentication
     pub fn should_skip(&self, path: &str) -> bool {
-        !has_dot_segment(path)
+        !is_ambiguous(path)
             && self.patterns.iter().any(|pattern| match pattern {
                 PathPattern::Exact(exact) => path == exact,
                 PathPattern::Prefix(prefix) => path.starts_with(prefix.as_str()),
@@ -93,11 +95,13 @@ impl PathFilter {
     }
 }
 
-fn has_dot_segment(path: &str) -> bool {
-    path.split('/').any(|seg| {
-        let seg = seg.to_ascii_lowercase().replace("%2e", ".");
-        seg == "." || seg == ".."
-    })
+fn is_ambiguous(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    ["%2f", "%5c", "%25", "\\"].iter().any(|p| path.contains(p))
+        || path.split('/').any(|seg| {
+            let seg = seg.replace("%2e", ".");
+            seg == "." || seg == ".."
+        })
 }
 
 /// Filter for health probes and static asset directories: `/health`,
@@ -146,7 +150,13 @@ mod tests {
         assert!(!filter.should_skip("/public/%2e%2e/admin"));
         assert!(!filter.should_skip("/public/.%2E/admin"));
         assert!(!filter.should_skip("/public/./x"));
+        assert!(!filter.should_skip("/public/%2e%2e%2fadmin"));
+        assert!(!filter.should_skip("/public/..%2Fadmin"));
+        assert!(!filter.should_skip("/public/..%5cadmin"));
+        assert!(!filter.should_skip("/public/..\\admin"));
+        assert!(!filter.should_skip("/public/%252e%252e/admin"));
         assert!(filter.should_skip("/public/..hidden"));
+        assert!(filter.should_skip("/public/a%20b.png"));
     }
 
     #[cfg(feature = "regex")]

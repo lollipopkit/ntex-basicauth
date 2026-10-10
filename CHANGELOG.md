@@ -60,8 +60,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   addresses could clear a block. Unseen IPs now share an overflow entry, as do
   requests without a peer address.
 - Suffix rules in `common_skip_paths` exempted dynamic routes such as
-  `/api/users/x.js` from authentication; paths with dot-segments never skip.
+  `/api/users/x.js` from authentication. Paths with dot-segments, encoded
+  separators (`%2f`, `%5c`), backslashes or double encoding never skip.
 - `Credentials`' `Debug` output contained the password.
+- `AuthError`'s `WebResponseError` impl sent 401 without `WWW-Authenticate`.
 - Non-ASCII usernames were rejected although the challenge announces UTF-8.
 - `users_from_file` trimmed passwords.
 - The `regex` feature did not compile without `cache`.

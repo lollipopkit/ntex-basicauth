@@ -1,6 +1,6 @@
 //! Middleware, builder and metrics
 
-use crate::error::{AuthError, AuthResult, challenge};
+use crate::error::{AuthError, AuthResult, DEFAULT_REALM, challenge};
 use crate::filter::PathFilter;
 use crate::limiter::{ConcurrencyLimiter, FailureLimiter, ProxyTrust};
 use crate::validator::{Credentials, StaticUserValidator, UserValidator};
@@ -425,7 +425,7 @@ impl Default for BasicAuthBuilder {
             users: StaticUserValidator::new(),
             validator: None,
             case_sensitive: true,
-            realm: "Restricted Area".into(),
+            realm: DEFAULT_REALM.into(),
             #[cfg(feature = "cache")]
             cache: None,
             path_filter: None,

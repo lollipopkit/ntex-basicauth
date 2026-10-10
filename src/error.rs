@@ -103,6 +103,9 @@ impl AuthError {
     }
 }
 
+/// Realm used when none is configured
+pub(crate) const DEFAULT_REALM: &str = "Restricted Area";
+
 /// Build the `WWW-Authenticate` value for `realm`, escaping it as a quoted-string.
 pub(crate) fn challenge(realm: &str) -> AuthResult<HeaderValue> {
     if realm.is_empty() || realm.chars().any(char::is_control) {
@@ -121,7 +124,7 @@ impl web::error::WebResponseError for AuthError {
     }
 
     fn error_response(&self, _: &web::HttpRequest) -> web::HttpResponse {
-        self.response(None)
+        self.to_response(DEFAULT_REALM)
     }
 }
 
@@ -165,6 +168,12 @@ mod tests {
         assert!(resp.headers().get(header::WWW_AUTHENTICATE).is_none());
         let resp = AuthError::InvalidCredentials.to_response("x");
         assert!(resp.headers().get(header::WWW_AUTHENTICATE).is_some());
+        let req = ntex::web::test::TestRequest::default().to_http_request();
+        let resp = web::WebResponseError::error_response(&AuthError::MissingHeader, &req);
+        assert_eq!(
+            resp.headers().get(header::WWW_AUTHENTICATE).unwrap(),
+            r#"Basic realm="Restricted Area", charset="UTF-8""#
+        );
         let resp = AuthError::RateLimited { retry_after: 42 }.to_response("x");
         assert_eq!(resp.headers().get(header::RETRY_AFTER).unwrap(), "42");
     }

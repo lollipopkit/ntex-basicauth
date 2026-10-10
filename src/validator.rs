@@ -178,13 +178,16 @@ impl UserValidator for StaticUserValidator {
 }
 
 /// BCrypt validator. Verification runs on the blocking thread pool.
+///
+/// Unknown users are checked against a dummy hash with the highest stored
+/// cost, so they take as long as known users. Use the same cost for all users:
+/// users whose hash has a lower cost remain distinguishable by response time.
 #[cfg(feature = "bcrypt")]
 pub struct BcryptUserValidator {
     users: HashMap<String, String>,
     cost: u32,
-    /// Cost of the dummy hash used for unknown users, so they take as long as
-    /// known ones. Tracks the highest cost among the stored hashes.
-    dummy_cost: u32,
+    /// Highest cost among the stored hashes
+    max_cost: Option<u32>,
     dummy_hash: Arc<std::sync::OnceLock<String>>,
 }
 
@@ -194,7 +197,7 @@ impl Default for BcryptUserValidator {
         Self {
             users: HashMap::new(),
             cost: bcrypt::DEFAULT_COST,
-            dummy_cost: bcrypt::DEFAULT_COST,
+            max_cost: None,
             dummy_hash: Default::default(),
         }
     }
@@ -217,7 +220,7 @@ impl BcryptUserValidator {
     pub fn add_user(&mut self, username: impl Into<String>, hash: impl Into<String>) -> &mut Self {
         let hash = hash.into();
         if let Some(cost) = hash.split('$').nth(2).and_then(|c| c.parse().ok()) {
-            self.dummy_cost = self.dummy_cost.max(cost);
+            self.max_cost = Some(self.max_cost.map_or(cost, |max| max.max(cost)));
         }
         self.users.insert(username.into(), hash);
         self
@@ -262,7 +265,7 @@ impl UserValidator for BcryptUserValidator {
         let hash = self.users.get(&credentials.username).cloned();
         let password = zeroize::Zeroizing::new(credentials.password.clone());
         let dummy_hash = Arc::clone(&self.dummy_hash);
-        let dummy_cost = self.dummy_cost;
+        let dummy_cost = self.max_cost.unwrap_or(self.cost);
 
         Box::pin(async move {
             ntex::rt::spawn_blocking(move || match hash {
@@ -364,5 +367,17 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[cfg(feature = "bcrypt")]
+    #[test]
+    fn bcrypt_dummy_cost_tracks_stored_hashes() {
+        let mut v = BcryptUserValidator::new();
+        assert_eq!(v.max_cost, None);
+        v.add_user("a", bcrypt::hash("x", 4).unwrap());
+        assert_eq!(v.max_cost, Some(4), "must not default to DEFAULT_COST");
+        v.add_user("b", bcrypt::hash("x", 5).unwrap());
+        v.add_user("c", bcrypt::hash("x", 4).unwrap());
+        assert_eq!(v.max_cost, Some(5));
     }
 }
