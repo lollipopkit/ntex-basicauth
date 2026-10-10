@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-10
+
 ### Breaking
 
 - `BasicAuth::builder()` / `BasicAuthBuilder` is the only way to configure the
@@ -89,3 +91,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Client IP and username (with `log_usernames`) in failure logs.
 - `StaticUserValidator` stores SHA-256 digests instead of plaintext passwords.
 - `LICENSE`, CI.
+
+[Unreleased]: https://github.com/lollipopkit/ntex-basicauth/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/lollipopkit/ntex-basicauth/releases/tag/v0.5.0
