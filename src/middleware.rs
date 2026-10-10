@@ -10,9 +10,10 @@ use ntex::http::Payload;
 use ntex::http::header::{self, HeaderMap, HeaderValue};
 use ntex::time::timeout;
 use ntex::{Middleware, Service, ServiceCtx, web};
+use std::cell::Cell;
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
@@ -66,8 +67,9 @@ pub struct AuthMetrics {
     successes: AtomicU64,
     failures: AtomicU64,
     cache_hits: AtomicU64,
-    validations: AtomicU64,
-    validation_micros: AtomicU64,
+    /// Validator calls and their total latency in microseconds, updated
+    /// together so that `reset` cannot split one measurement
+    validation: Mutex<(u64, u64)>,
 }
 
 impl AuthMetrics {
@@ -93,13 +95,13 @@ impl AuthMetrics {
 
     /// Calls to the validator
     pub fn validations(&self) -> u64 {
-        self.validations.load(Ordering::Relaxed)
+        self.validation_stats().0
     }
 
     /// Average validator latency
     pub fn avg_validation_time(&self) -> Duration {
-        let micros = self.validation_micros.load(Ordering::Relaxed);
-        Duration::from_micros(micros.checked_div(self.validations()).unwrap_or(0))
+        let (count, micros) = self.validation_stats();
+        Duration::from_micros(micros.checked_div(count).unwrap_or(0))
     }
 
     /// Reset all counters
@@ -109,11 +111,10 @@ impl AuthMetrics {
             &self.successes,
             &self.failures,
             &self.cache_hits,
-            &self.validations,
-            &self.validation_micros,
         ] {
             counter.store(0, Ordering::Relaxed);
         }
+        *self.lock_validation() = (0, 0);
     }
 
     fn incr(counter: &AtomicU64) {
@@ -121,9 +122,18 @@ impl AuthMetrics {
     }
 
     fn record_validation(&self, elapsed: Duration) {
-        Self::incr(&self.validations);
         let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
-        self.validation_micros.fetch_add(micros, Ordering::Relaxed);
+        let mut stats = self.lock_validation();
+        stats.0 += 1;
+        stats.1 = stats.1.saturating_add(micros);
+    }
+
+    fn validation_stats(&self) -> (u64, u64) {
+        *self.lock_validation()
+    }
+
+    fn lock_validation(&self) -> std::sync::MutexGuard<'_, (u64, u64)> {
+        self.validation.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -261,9 +271,7 @@ impl Inner {
             return Ok(true);
         }
 
-        let start = Instant::now();
         let valid = self.validate(credentials).await;
-        self.metrics.record_validation(start.elapsed());
 
         #[cfg(feature = "cache")]
         if let (Ok(true), Some(cache), Some(key)) = (&valid, &self.cache, cache_key) {
@@ -279,15 +287,21 @@ impl Inner {
     /// in a spawned task holding the permit until the validator really
     /// finishes, even if this request times out, so validators that cannot be
     /// cancelled (bcrypt on a blocking thread) cannot pile up past the limit.
+    ///
+    /// Latency is recorded from the validator call until its result or the
+    /// timeout; requests that never reach the validator are not recorded.
     async fn validate(&self, credentials: &Credentials) -> AuthResult<bool> {
-        match &self.concurrency {
+        let started = Cell::new(None);
+        let result = match &self.concurrency {
             None => {
+                started.set(Some(Instant::now()));
                 self.with_timeout(self.validator.validate(credentials))
                     .await
             }
             Some(limiter) => {
                 self.with_timeout(async {
                     let permit = limiter.acquire().await;
+                    started.set(Some(Instant::now()));
                     let validator = Arc::clone(&self.validator);
                     let credentials = credentials.clone();
                     ntex::rt::spawn(async move {
@@ -299,7 +313,11 @@ impl Inner {
                 })
                 .await
             }
+        };
+        if let Some(started) = started.get() {
+            self.metrics.record_validation(started.elapsed());
         }
+        result
     }
 
     async fn with_timeout(&self, fut: impl Future<Output = AuthResult<bool>>) -> AuthResult<bool> {
@@ -783,6 +801,9 @@ mod tests {
         let m = auth.metrics();
         assert_eq!((m.requests(), m.successes(), m.failures()), (3, 1, 2));
         assert_eq!(m.validations(), 2);
+        m.reset();
+        assert_eq!((m.requests(), m.validations()), (0, 0));
+        assert_eq!(m.avg_validation_time(), Duration::ZERO);
     }
 
     #[ntex::test]
@@ -937,7 +958,7 @@ mod tests {
             .validation_timeout(Duration::from_millis(50))
             .build()
             .unwrap();
-        let app = app(auth).await;
+        let app = app(auth.clone()).await;
 
         // The first request holds the only permit past its timeout; the second
         // times out while queued and must not run the validator afterwards.
@@ -949,6 +970,8 @@ mod tests {
         );
         ntex::time::sleep(Duration::from_millis(400)).await;
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+        // Only the request that reached the validator is recorded.
+        assert_eq!(auth.metrics().validations(), 1);
     }
 
     #[ntex::test]
