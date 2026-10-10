@@ -29,6 +29,8 @@
 //!     .await
 //! }
 //!
+//! // `/` is not skipped by `common_skip_paths`, so the user is always present.
+//! // Take `Option<AuthenticatedUser>` in handlers of skipped routes instead.
 //! async fn index(user: AuthenticatedUser) -> String {
 //!     format!("Hello, {}!", user.username())
 //! }

@@ -66,6 +66,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `/api/users/x.js` from authentication. Paths with dot-segments, encoded
   separators (`%2f`, `%5c`) or backslashes, including nested encodings such
   as `%252e`, never skip.
+- With `max_concurrent_validations`, requests that timed out while waiting
+  for a permit still ran the validator later.
 - Concurrent requests could exceed the failure budget while their
   validations were in flight; attempts in flight now count against it.
 - Out-of-range bcrypt costs in stored hashes no longer break the dummy hash

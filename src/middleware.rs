@@ -274,11 +274,11 @@ impl Inner {
 
     /// Run the validator under the optional concurrency limit and timeout.
     ///
-    /// With a concurrency limit, validation runs in a spawned task holding the
-    /// permit until the validator really finishes, even if this request times
-    /// out. Validators that cannot be cancelled (bcrypt on a blocking thread)
-    /// therefore cannot pile up past the limit. Waiting for a permit counts
-    /// towards the timeout.
+    /// With a concurrency limit, waiting for a permit counts towards the
+    /// timeout and is abandoned with the request. Once started, validation runs
+    /// in a spawned task holding the permit until the validator really
+    /// finishes, even if this request times out, so validators that cannot be
+    /// cancelled (bcrypt on a blocking thread) cannot pile up past the limit.
     async fn validate(&self, credentials: &Credentials) -> AuthResult<bool> {
         match &self.concurrency {
             None => {
@@ -286,16 +286,16 @@ impl Inner {
                     .await
             }
             Some(limiter) => {
-                let validator = Arc::clone(&self.validator);
-                let limiter = Arc::clone(limiter);
-                let credentials = credentials.clone();
-                let task = ntex::rt::spawn(async move {
-                    let _permit = limiter.acquire().await;
-                    validator.validate(&credentials).await
-                });
                 self.with_timeout(async {
-                    task.await
-                        .map_err(|_| AuthError::Validator("validation task failed".into()))?
+                    let permit = limiter.acquire().await;
+                    let validator = Arc::clone(&self.validator);
+                    let credentials = credentials.clone();
+                    ntex::rt::spawn(async move {
+                        let _permit = permit;
+                        validator.validate(&credentials).await
+                    })
+                    .await
+                    .map_err(|_| AuthError::Validator("validation task failed".into()))?
                 })
                 .await
             }
@@ -912,6 +912,43 @@ mod tests {
             let resp = get(&app, "/", Some("a:b")).await;
             assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         }
+    }
+
+    #[ntex::test]
+    async fn timed_out_request_leaves_permit_queue() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct Counting(Arc<AtomicUsize>);
+
+        impl UserValidator for Counting {
+            fn validate<'a>(&'a self, _: &'a Credentials) -> BoxFuture<'a, AuthResult<bool>> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async {
+                    ntex::time::sleep(Duration::from_millis(200)).await;
+                    Ok(true)
+                })
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let auth = BasicAuth::builder()
+            .validator(Counting(Arc::clone(&calls)))
+            .max_concurrent_validations(1)
+            .validation_timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let app = app(auth).await;
+
+        // The first request holds the only permit past its timeout; the second
+        // times out while queued and must not run the validator afterwards.
+        let resps = ntex::util::join_all((0..2).map(|_| get(&app, "/", Some("a:b")))).await;
+        assert!(
+            resps
+                .iter()
+                .all(|r| r.status() == StatusCode::SERVICE_UNAVAILABLE)
+        );
+        ntex::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     #[ntex::test]
