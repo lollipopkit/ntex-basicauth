@@ -64,7 +64,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   requests without a peer address.
 - Suffix rules in `common_skip_paths` exempted dynamic routes such as
   `/api/users/x.js` from authentication. Paths with dot-segments, encoded
-  separators (`%2f`, `%5c`), backslashes or double encoding never skip.
+  separators (`%2f`, `%5c`) or backslashes, including nested encodings such
+  as `%252e`, never skip.
 - Concurrent requests could exceed the failure budget while their
   validations were in flight; attempts in flight now count against it.
 - Out-of-range bcrypt costs in stored hashes no longer break the dummy hash

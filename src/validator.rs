@@ -213,6 +213,7 @@ impl BcryptUserValidator {
     /// Cost factor used by [`add_user_with_password`](Self::add_user_with_password)
     pub fn with_cost(mut self, cost: u32) -> Self {
         self.cost = cost;
+        self.dummy_hash = Default::default();
         self
     }
 
@@ -225,8 +226,11 @@ impl BcryptUserValidator {
             .nth(2)
             .and_then(|c| c.parse().ok())
             .filter(|c| (4..=31).contains(c))
+            && self.max_cost.is_none_or(|max| cost > max)
         {
-            self.max_cost = Some(self.max_cost.map_or(cost, |max| max.max(cost)));
+            self.max_cost = Some(cost);
+            // A dummy built earlier would be cheaper than this user's hash.
+            self.dummy_hash = Default::default();
         }
         self.users.insert(username.into(), hash);
         self
@@ -386,5 +390,20 @@ mod tests {
         v.add_user("c", bcrypt::hash("x", 4).unwrap());
         v.add_user("d", "$2b$99$malformed");
         assert_eq!(v.max_cost, Some(5));
+    }
+
+    #[cfg(feature = "bcrypt")]
+    #[ntex::test]
+    async fn bcrypt_dummy_rebuilt_after_cost_increase() {
+        let cost = |h: &str| h.split('$').nth(2).unwrap().parse::<u32>().unwrap();
+        let mut v = BcryptUserValidator::new();
+        v.add_user("a", bcrypt::hash("x", 4).unwrap());
+        let unknown = Credentials::new("nobody", "x");
+        assert!(!v.validate(&unknown).await.unwrap());
+        assert_eq!(cost(v.dummy_hash.get().unwrap()), 4);
+
+        v.add_user("b", bcrypt::hash("x", 5).unwrap());
+        assert!(!v.validate(&unknown).await.unwrap());
+        assert_eq!(cost(v.dummy_hash.get().unwrap()), 5);
     }
 }

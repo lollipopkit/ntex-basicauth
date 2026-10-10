@@ -6,9 +6,10 @@ use regex::Regex;
 /// Set of path patterns that skip authentication.
 ///
 /// Paths that a later component could resolve differently never match:
-/// dot-segments (`..`, `%2e%2e`), encoded separators (`%2f`, `%5c`),
-/// backslashes and double encoding (`%25`). So neither `/static/../admin` nor
-/// `/static/%2e%2e%2fadmin` can be used to bypass authentication.
+/// dot-segments (`..`, `%2e%2e`), encoded separators (`%2f`, `%5c`) and
+/// backslashes, also when encoded more than once (`%252e`). So neither
+/// `/static/../admin` nor `/static/%2e%2e%2fadmin` can be used to bypass
+/// authentication, while `/static/100%25.png` still matches.
 #[derive(Debug, Clone, Default)]
 pub struct PathFilter {
     patterns: Vec<PathPattern>,
@@ -96,8 +97,13 @@ impl PathFilter {
 }
 
 fn is_ambiguous(path: &str) -> bool {
-    let path = path.to_ascii_lowercase();
-    ["%2f", "%5c", "%25", "\\"].iter().any(|p| path.contains(p))
+    // Undo nested encoding (`%252e` -> `%2e`), so a component that decodes
+    // more than once cannot see a separator or dot-segment we missed.
+    let mut path = path.to_ascii_lowercase();
+    while path.contains("%25") {
+        path = path.replace("%25", "%");
+    }
+    ["%2f", "%5c", "\\"].iter().any(|p| path.contains(p))
         || path.split('/').any(|seg| {
             let seg = seg.replace("%2e", ".");
             seg == "." || seg == ".."
@@ -155,6 +161,8 @@ mod tests {
         assert!(!filter.should_skip("/public/..%5cadmin"));
         assert!(!filter.should_skip("/public/..\\admin"));
         assert!(!filter.should_skip("/public/%252e%252e/admin"));
+        assert!(!filter.should_skip("/public/..%25252Fadmin"));
+        assert!(filter.should_skip("/public/100%25.png"));
         assert!(filter.should_skip("/public/..hidden"));
         assert!(filter.should_skip("/public/a%20b.png"));
     }
