@@ -1,257 +1,131 @@
 //! Authentication error types and response handling
 
-use ntex::{http::StatusCode, web};
+use ntex::http::{StatusCode, header, header::HeaderValue};
+use ntex::web;
 use thiserror::Error;
-
-#[cfg(feature = "json")]
-use serde::{Deserialize, Serialize};
 
 /// Authentication error type
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum AuthError {
-    #[error("Missing Authorization header")]
-    /// Missing Authorization header
+    /// Missing `Authorization` header
+    #[error("missing Authorization header")]
     MissingHeader,
 
-    #[error("Invalid Authorization header format")]
-    /// Invalid format of Authorization header
-    InvalidFormat,
+    /// Malformed `Authorization` header (wrong scheme, bad Base64, non UTF-8, ...)
+    #[error("invalid Authorization header")]
+    InvalidHeader,
 
-    #[error("Invalid Base64 encoding")]
-    /// Invalid Base64 encoding
-    InvalidBase64,
-
-    #[error("Invalid user credentials")]
-    /// Invalid user credentials
+    /// Unknown user or wrong password
+    #[error("invalid credentials")]
     InvalidCredentials,
 
-    #[error("User validation failed: {0}")]
-    /// User validation failed with a message
-    ValidationFailed(String),
+    /// Too many failed attempts from the client IP
+    #[error("too many failed authentication attempts, retry after {retry_after}s")]
+    RateLimited {
+        /// Seconds until the client may retry, sent as `Retry-After`
+        retry_after: u64,
+    },
 
-    #[error("Cache operation failed: {0}")]
-    /// Cache operation failed with a message
-    CacheError(String),
+    /// The validator did not finish within the configured timeout
+    #[error("validation timed out")]
+    Timeout,
 
-    #[error("Configuration error: {0}")]
-    /// Configuration error with a message
-    ConfigError(String),
+    /// The validator backend failed (database down, malformed stored hash, ...)
+    #[error("validator error: {0}")]
+    Validator(String),
 
-    #[error("Internal server error: {0}")]
-    /// Internal server error with a message
-    InternalError(String),
-
-    #[error("Rate limit exceeded")]
-    /// Rate limit exceeded (too many authentication attempts)
-    RateLimited,
+    /// Invalid middleware configuration
+    #[error("configuration error: {0}")]
+    Config(String),
 }
 
 /// Authentication result type
 pub type AuthResult<T> = Result<T, AuthError>;
 
-/// Error response structure
-#[derive(Debug)]
-#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
-#[cfg_attr(not(feature = "json"), allow(dead_code))]
-struct AuthErrorResponse {
-    code: u16,
-    message: &'static str,
-    error: String,
-    #[cfg_attr(feature = "json", serde(skip_serializing_if = "Option::is_none"))]
-    details: Option<String>,
-    #[cfg_attr(feature = "json", serde(skip_serializing_if = "Option::is_none"))]
-    error_id: Option<String>,
+impl AuthError {
+    /// HTTP status code for this error
+    pub fn status_code(&self) -> StatusCode {
+        match self {
+            Self::MissingHeader | Self::InvalidHeader | Self::InvalidCredentials => {
+                StatusCode::UNAUTHORIZED
+            }
+            Self::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
+            Self::Timeout => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Validator(_) | Self::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    /// Whether this error is caused by the client
+    pub fn is_client_error(&self) -> bool {
+        self.status_code().is_client_error()
+    }
+
+    /// Message exposed to the client. Never contains internal details.
+    fn public_message(&self) -> &'static str {
+        match self {
+            Self::MissingHeader | Self::InvalidHeader => "Authentication required",
+            Self::InvalidCredentials => "Invalid credentials",
+            Self::RateLimited { .. } => "Too many failed attempts",
+            Self::Timeout => "Authentication timed out",
+            Self::Validator(_) | Self::Config(_) => "Internal server error",
+        }
+    }
+
+    /// Build the error response, adding a `WWW-Authenticate` challenge for 401s.
+    pub fn to_response(&self, realm: &str) -> web::HttpResponse {
+        self.response(challenge(realm).ok().as_ref())
+    }
+
+    pub(crate) fn response(&self, challenge: Option<&HeaderValue>) -> web::HttpResponse {
+        let status = self.status_code();
+        let mut builder = web::HttpResponse::build(status);
+        builder
+            .set_header(header::CONTENT_TYPE, "application/json")
+            .set_header(header::CACHE_CONTROL, "no-store");
+        match self {
+            Self::RateLimited { retry_after } => {
+                builder.set_header(header::RETRY_AFTER, *retry_after);
+            }
+            _ if status == StatusCode::UNAUTHORIZED => {
+                if let Some(challenge) = challenge {
+                    builder.set_header(header::WWW_AUTHENTICATE, challenge.clone());
+                }
+            }
+            _ => {}
+        }
+        // Both fields are static and JSON-safe, so no serializer is needed.
+        builder.body(format!(
+            r#"{{"code":{},"message":"{}"}}"#,
+            status.as_u16(),
+            self.public_message()
+        ))
+    }
 }
 
-impl AuthError {
-    /// Create HTTP 401 response with appropriate WWW-Authenticate header
-    pub fn to_response(&self, realm: &str) -> web::HttpResponse {
-        self.to_response_with_details(realm, None)
+/// Realm used when none is configured
+pub(crate) const DEFAULT_REALM: &str = "Restricted Area";
+
+/// Build the `WWW-Authenticate` value for `realm`, escaping it as a quoted-string.
+pub(crate) fn challenge(realm: &str) -> AuthResult<HeaderValue> {
+    if realm.is_empty() || realm.chars().any(char::is_control) {
+        return Err(AuthError::Config(
+            "realm must be non-empty and contain no control characters".into(),
+        ));
     }
-
-    /// Create HTTP 401 response with custom details
-    pub fn to_response_with_details(
-        &self,
-        realm: &str,
-        details: Option<String>,
-    ) -> web::HttpResponse {
-        let (status_code, message) = match self {
-            AuthError::MissingHeader | AuthError::InvalidFormat | AuthError::InvalidBase64 => {
-                (StatusCode::UNAUTHORIZED, "Authentication required")
-            }
-            AuthError::InvalidCredentials => (StatusCode::UNAUTHORIZED, "Invalid credentials"),
-            AuthError::ValidationFailed(_) => (StatusCode::UNAUTHORIZED, "Validation failed"),
-            AuthError::ConfigError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Configuration error"),
-            AuthError::CacheError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Cache error"),
-            AuthError::InternalError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Internal error"),
-            AuthError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded"),
-        };
-
-        let error_response = AuthErrorResponse {
-            code: status_code.as_u16(),
-            message,
-            error: self.to_string(),
-            details,
-            error_id: Some(self.error_id()),
-        };
-
-        #[cfg(feature = "json")]
-        let body = serde_json::to_string(&error_response)
-            .unwrap_or_else(|_| self.fallback_json_response());
-
-        #[cfg(not(feature = "json"))]
-        let body = format!(
-            r#"{{"code":{},"message":"{}","error":"{}"}}"#,
-            error_response.code,
-            error_response.message,
-            self.escape_json(&error_response.error)
-        );
-
-        let mut binding = web::HttpResponse::build(status_code);
-        let mut response = binding
-            .set_header("content-type", "application/json")
-            .set_header("cache-control", "no-store");
-
-        // Only add WWW-Authenticate header for authentication errors
-        if status_code == StatusCode::UNAUTHORIZED {
-            let www_authenticate = format!(
-                "Basic realm=\"{}\", charset=\"UTF-8\"",
-                self.escape_header_value(realm)
-            );
-            response = response.set_header("www-authenticate", www_authenticate);
-        }
-
-        response.body(body)
-    }
-
-    /// Generate error ID for log tracing
-    fn error_id(&self) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-        std::mem::discriminant(self).hash(&mut hasher);
-        format!("AUTH_{:x}", hasher.finish())
-    }
-
-    #[cfg(not(feature = "json"))]
-    /// Escape JSON string (handles all control characters to prevent injection)
-    fn escape_json(&self, s: &str) -> String {
-        let mut out = String::with_capacity(s.len() + 2);
-        for c in s.chars() {
-            match c {
-                '\\' => out.push_str("\\\\"),
-                '"' => out.push_str("\\\""),
-                '\n' => out.push_str("\\n"),
-                '\r' => out.push_str("\\r"),
-                '\t' => out.push_str("\\t"),
-                c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
-                c => out.push(c),
-            }
-        }
-        out
-    }
-
-    /// Escape HTTP header value: strip control characters (CRLF injection
-    /// prevention) and escape quotes/backslashes for the quoted-string form.
-    fn escape_header_value(&self, s: &str) -> String {
-        let mut out = String::with_capacity(s.len());
-        for c in s.chars() {
-            match c {
-                '"' => out.push_str("\\\""),
-                '\\' => out.push_str("\\\\"),
-                c if c.is_control() => {}
-                c => out.push(c),
-            }
-        }
-        out
-    }
-
-    /// Fallback JSON response (when serialization fails)
-    #[cfg(feature = "json")]
-    fn fallback_json_response(&self) -> String {
-        r#"{"code":500,"message":"Internal error","error":"Response serialization failed"}"#
-            .to_string()
-    }
-
-    /// Check if this is a client error
-    pub fn is_client_error(&self) -> bool {
-        matches!(
-            self,
-            AuthError::MissingHeader
-                | AuthError::InvalidFormat
-                | AuthError::InvalidBase64
-                | AuthError::InvalidCredentials
-                | AuthError::RateLimited
-        )
-    }
-
-    /// Check if this is a server error
-    pub fn is_server_error(&self) -> bool {
-        !self.is_client_error()
-    }
-
-    /// Get suggested log level
-    pub fn log_level(&self) -> &'static str {
-        match self {
-            AuthError::MissingHeader | AuthError::InvalidCredentials => "info",
-            AuthError::InvalidFormat | AuthError::InvalidBase64 => "warn",
-            AuthError::ValidationFailed(_) => "warn",
-            AuthError::ConfigError(_) | AuthError::InternalError(_) => "error",
-            AuthError::CacheError(_) | AuthError::RateLimited => "warn",
-        }
-    }
+    let escaped = realm.replace('\\', "\\\\").replace('"', "\\\"");
+    HeaderValue::from_str(&format!("Basic realm=\"{escaped}\", charset=\"UTF-8\""))
+        .map_err(|_| AuthError::Config("realm is not a valid header value".into()))
 }
 
 impl web::error::WebResponseError for AuthError {
     fn status_code(&self) -> StatusCode {
-        match self {
-            AuthError::MissingHeader
-            | AuthError::InvalidFormat
-            | AuthError::InvalidBase64
-            | AuthError::InvalidCredentials
-            | AuthError::ValidationFailed(_) => StatusCode::UNAUTHORIZED,
-
-            AuthError::ConfigError(_) | AuthError::CacheError(_) | AuthError::InternalError(_) => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
-
-            AuthError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
-        }
+        AuthError::status_code(self)
     }
 
-    fn error_response(&self, _req: &ntex::web::HttpRequest) -> web::HttpResponse {
-        self.to_response("Restricted Area")
+    fn error_response(&self, _: &web::HttpRequest) -> web::HttpResponse {
+        self.to_response(DEFAULT_REALM)
     }
-}
-
-/// Convenience macro for creating errors
-#[macro_export]
-macro_rules! auth_error {
-    (missing_header) => {
-        $crate::AuthError::MissingHeader
-    };
-    (invalid_format) => {
-        $crate::AuthError::InvalidFormat
-    };
-    (invalid_base64) => {
-        $crate::AuthError::InvalidBase64
-    };
-    (invalid_credentials) => {
-        $crate::AuthError::InvalidCredentials
-    };
-    (validation_failed, $msg:expr) => {
-        $crate::AuthError::ValidationFailed($msg.to_string())
-    };
-    (cache_error, $msg:expr) => {
-        $crate::AuthError::CacheError($msg.to_string())
-    };
-    (config_error, $msg:expr) => {
-        $crate::AuthError::ConfigError($msg.to_string())
-    };
-    (internal_error, $msg:expr) => {
-        $crate::AuthError::InternalError($msg.to_string())
-    };
 }
 
 #[cfg(test)]
@@ -259,50 +133,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_error_classification() {
-        assert!(AuthError::MissingHeader.is_client_error());
+    fn status_codes() {
+        assert_eq!(
+            AuthError::MissingHeader.status_code(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            AuthError::RateLimited { retry_after: 1 }.status_code(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            AuthError::Timeout.status_code(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
         assert!(AuthError::InvalidCredentials.is_client_error());
-        assert!(AuthError::ConfigError("test".to_string()).is_server_error());
-        assert!(AuthError::InternalError("test".to_string()).is_server_error());
+        assert!(!AuthError::Validator("db".into()).is_client_error());
     }
 
     #[test]
-    fn test_error_id_consistency() {
-        let error1 = AuthError::MissingHeader;
-        let error2 = AuthError::MissingHeader;
-        assert_eq!(error1.error_id(), error2.error_id());
-
-        let error3 = AuthError::InvalidCredentials;
-        assert_ne!(error1.error_id(), error3.error_id());
+    fn challenge_rejects_crlf_and_escapes_quotes() {
+        assert!(challenge("safe\r\nX-Injected: evil").is_err());
+        assert!(challenge("").is_err());
+        let value = challenge(r#"a "b" \c"#).unwrap();
+        assert_eq!(
+            value.to_str().unwrap(),
+            r#"Basic realm="a \"b\" \\c", charset="UTF-8""#
+        );
     }
 
     #[test]
-    fn test_escape_header_value_strips_crlf() {
-        let error = AuthError::MissingHeader;
-        // CRLF must be stripped to prevent HTTP response header injection
-        // via a crafted realm value.
-        let escaped = error.escape_header_value("safe\r\nX-Injected: evil");
-        assert!(!escaped.contains('\r'));
-        assert!(!escaped.contains('\n'));
-        // Without CRLF, "X-Injected" can no longer start a new header line;
-        // it just remains literal text inside the quoted realm value.
-        assert!(escaped.contains("X-Injected"));
-    }
-
-    #[cfg(not(feature = "json"))]
-    #[test]
-    fn test_json_escaping() {
-        let error =
-            AuthError::ValidationFailed("Message with \"quotes\" and\nnew line".to_string());
-        let escaped = error.escape_json(&error.to_string());
-        assert!(!escaped.contains('\n'));
-        assert!(escaped.contains("\\\""));
-    }
-
-    #[test]
-    fn test_macro_usage() {
-        let _error1 = auth_error!(missing_header);
-        let _error2 = auth_error!(validation_failed, "Custom message");
-        let _error3 = auth_error!(config_error, "Configuration issue");
+    fn response_hides_internal_details() {
+        let resp = AuthError::Validator("secret db dsn".into()).to_response("x");
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(resp.headers().get(header::WWW_AUTHENTICATE).is_none());
+        let resp = AuthError::InvalidCredentials.to_response("x");
+        assert!(resp.headers().get(header::WWW_AUTHENTICATE).is_some());
+        let req = ntex::web::test::TestRequest::default().to_http_request();
+        let resp = web::WebResponseError::error_response(&AuthError::MissingHeader, &req);
+        assert_eq!(
+            resp.headers().get(header::WWW_AUTHENTICATE).unwrap(),
+            r#"Basic realm="Restricted Area", charset="UTF-8""#
+        );
+        let resp = AuthError::RateLimited { retry_after: 42 }.to_response("x");
+        assert_eq!(resp.headers().get(header::RETRY_AFTER).unwrap(), "42");
     }
 }
