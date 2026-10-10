@@ -77,7 +77,7 @@ fn auth() -> AuthResult<BasicAuth> {
 
 Notes:
 
-- `max_failures_per_ip` only counts failed attempts (wrong credentials or a malformed header); successful requests are never throttled. Blocked clients get 429 with `Retry-After`. IPv6 clients are grouped by /64.
+- `max_failures_per_ip` only counts failed attempts (wrong credentials or a malformed header); successful requests are never throttled. Attempts still being validated count against the budget, so parallel requests cannot exceed it (enable the cache with slow validators). Blocked clients get 429 with `Retry-After`. IPv6 clients are grouped by /64.
 - The client IP is the peer address. `X-Forwarded-For` is read only when the peer is in `trusted_proxies`, taking the rightmost hop that is not a trusted proxy (hops a client prepends are ignored). Behind an unlisted proxy, all clients share the proxy's failure budget.
 - Requests without a peer address (Unix sockets) share one failure budget by default. Behind a local reverse proxy on a Unix socket, enable `trust_peerless_proxy(true)` to key them by `X-Forwarded-For` instead.
 - At most 65536 clients are tracked; beyond that, new clients share the same overflow entry.

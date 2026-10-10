@@ -62,6 +62,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Suffix rules in `common_skip_paths` exempted dynamic routes such as
   `/api/users/x.js` from authentication. Paths with dot-segments, encoded
   separators (`%2f`, `%5c`), backslashes or double encoding never skip.
+- Concurrent requests could exceed the failure budget while their
+  validations were in flight; attempts in flight now count against it.
+- Out-of-range bcrypt costs in stored hashes no longer break the dummy hash
+  used for unknown users.
+- Bumped `event-listener` to 5.4.2 (RUSTSEC-2026-0221).
 - `Credentials`' `Debug` output contained the password.
 - `AuthError`'s `WebResponseError` impl sent 401 without `WWW-Authenticate`.
 - Non-ASCII usernames were rejected although the challenge announces UTF-8.

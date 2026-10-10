@@ -219,7 +219,13 @@ impl BcryptUserValidator {
     /// Add a user with a precomputed BCrypt hash
     pub fn add_user(&mut self, username: impl Into<String>, hash: impl Into<String>) -> &mut Self {
         let hash = hash.into();
-        if let Some(cost) = hash.split('$').nth(2).and_then(|c| c.parse().ok()) {
+        // Out-of-range costs cannot be hashed, so they must not drive the dummy.
+        if let Some(cost) = hash
+            .split('$')
+            .nth(2)
+            .and_then(|c| c.parse().ok())
+            .filter(|c| (4..=31).contains(c))
+        {
             self.max_cost = Some(self.max_cost.map_or(cost, |max| max.max(cost)));
         }
         self.users.insert(username.into(), hash);
@@ -378,6 +384,7 @@ mod tests {
         assert_eq!(v.max_cost, Some(4), "must not default to DEFAULT_COST");
         v.add_user("b", bcrypt::hash("x", 5).unwrap());
         v.add_user("c", bcrypt::hash("x", 4).unwrap());
+        v.add_user("d", "$2b$99$malformed");
         assert_eq!(v.max_cost, Some(5));
     }
 }

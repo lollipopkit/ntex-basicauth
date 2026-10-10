@@ -2,7 +2,7 @@
 
 use crate::error::{AuthError, AuthResult, DEFAULT_REALM, challenge};
 use crate::filter::PathFilter;
-use crate::limiter::{ConcurrencyLimiter, FailureLimiter, ProxyTrust};
+use crate::limiter::{ConcurrencyLimiter, FailureLimiter, ProxyTrust, Reservation};
 use crate::validator::{Credentials, StaticUserValidator, UserValidator};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use ipnet::IpNet;
@@ -189,18 +189,20 @@ impl Inner {
         AuthMetrics::incr(&self.metrics.requests);
 
         let ip = self.proxy_trust.client_ip(peer, headers);
-        if let Some(retry) = self
-            .failure_limiter
-            .as_ref()
-            .and_then(|l| l.blocked_for(ip))
-        {
-            let retry_after = retry.as_secs() + u64::from(retry.subsec_nanos() > 0);
-            return Err(self.fail(AuthError::RateLimited { retry_after }, ip, None));
-        }
+        // Held across validation and dropped on success or cancellation.
+        let attempt = match self.failure_limiter.as_ref().map(|l| l.reserve(ip)) {
+            Some(Err(retry)) => {
+                let retry_after = retry.as_secs() + u64::from(retry.subsec_nanos() > 0);
+                let err = AuthError::RateLimited { retry_after };
+                return Err(self.fail(err, ip, None, None));
+            }
+            Some(Ok(attempt)) => Some(attempt),
+            None => None,
+        };
 
         let credentials = match parse_credentials(headers, self.max_header_size) {
             Ok(credentials) => credentials,
-            Err(err) => return Err(self.fail(err, ip, None)),
+            Err(err) => return Err(self.fail(err, ip, attempt, None)),
         };
 
         match self.check(&credentials).await {
@@ -210,8 +212,11 @@ impl Inner {
                     username: credentials.username.clone(),
                 })
             }
-            Ok(false) => Err(self.fail(AuthError::InvalidCredentials, ip, Some(&credentials))),
-            Err(err) => Err(self.fail(err, ip, Some(&credentials))),
+            Ok(false) => {
+                let err = AuthError::InvalidCredentials;
+                Err(self.fail(err, ip, attempt, Some(&credentials)))
+            }
+            Err(err) => Err(self.fail(err, ip, attempt, Some(&credentials))),
         }
     }
 
@@ -220,16 +225,18 @@ impl Inner {
         &self,
         err: AuthError,
         ip: Option<IpAddr>,
+        attempt: Option<Reservation<'_>>,
         credentials: Option<&Credentials>,
     ) -> AuthError {
         AuthMetrics::incr(&self.metrics.failures);
 
+        // Other errors release the reservation when it is dropped.
         if matches!(
             err,
             AuthError::InvalidHeader | AuthError::InvalidCredentials
-        ) && let Some(limiter) = &self.failure_limiter
+        ) && let Some(attempt) = attempt
         {
-            limiter.record_failure(ip);
+            attempt.fail();
         }
 
         let user = credentials
@@ -572,6 +579,12 @@ impl BasicAuthBuilder {
 
     /// Answer 429 to a client IP after `max` failed attempts within `window`.
     /// Successful requests are not counted.
+    ///
+    /// Attempts still being validated count against the budget, so concurrent
+    /// requests cannot exceed it; once failures plus attempts in flight reach
+    /// `max`, further requests get 429 with `Retry-After: 1`. With a slow
+    /// validator, enable the cache so that parallel requests of a logged-in
+    /// client are answered from it.
     pub fn max_failures_per_ip(mut self, max: u32, window: Duration) -> Self {
         self.max_failures_per_ip = Some((max, window));
         self
@@ -847,6 +860,40 @@ mod tests {
                 Ok(true)
             })
         }
+    }
+
+    #[ntex::test]
+    async fn concurrent_attempts_bounded_by_budget() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct Counting(Arc<AtomicUsize>);
+
+        impl UserValidator for Counting {
+            fn validate<'a>(&'a self, _: &'a Credentials) -> BoxFuture<'a, AuthResult<bool>> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async {
+                    ntex::time::sleep(Duration::from_millis(50)).await;
+                    Ok(false)
+                })
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let auth = BasicAuth::builder()
+            .validator(Counting(Arc::clone(&calls)))
+            .max_failures_per_ip(2, Duration::from_secs(60))
+            .build()
+            .unwrap();
+        let app = app(auth).await;
+        let resps =
+            ntex::util::join_all((0..10).map(|_| get(&app, "/", Some("admin:guess")))).await;
+
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        let limited = resps
+            .iter()
+            .filter(|r| r.status() == StatusCode::TOO_MANY_REQUESTS)
+            .count();
+        assert_eq!(limited, 8);
     }
 
     #[ntex::test]

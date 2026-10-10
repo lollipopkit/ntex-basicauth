@@ -198,6 +198,9 @@ struct FailureState {
 
 struct FailureEntry {
     failures: u32,
+    /// Attempts still being validated; they count against the budget so
+    /// concurrent requests cannot exceed it before their failures are recorded
+    pending: u32,
     window_start: Instant,
 }
 
@@ -213,44 +216,94 @@ impl FailureLimiter {
         }
     }
 
-    /// Remaining block time if `ip` has exhausted its failure budget.
-    pub(crate) fn blocked_for(&self, ip: Option<IpAddr>) -> Option<Duration> {
-        let now = Instant::now();
-        let state = self.lock();
-        let entry = state.entries.get(&state.key(ip))?;
-        let elapsed = now.duration_since(entry.window_start);
-        (elapsed < self.window && entry.failures >= self.max_failures)
-            .then(|| self.window - elapsed)
-    }
-
-    /// Record a failed attempt from `ip`.
-    pub(crate) fn record_failure(&self, ip: Option<IpAddr>) {
+    /// Reserve an attempt for `ip`, or return how long to wait.
+    ///
+    /// Fails once recorded failures plus attempts in flight reach the budget.
+    /// The reservation is released when dropped (including on cancellation)
+    /// unless it is turned into a failure with [`Reservation::fail`].
+    pub(crate) fn reserve(&self, ip: Option<IpAddr>) -> Result<Reservation<'_>, Duration> {
         let now = Instant::now();
         let window = self.window;
         let mut state = self.lock();
 
-        // Lazy pruning, at most once per window.
+        // Lazy pruning, at most once per window. Entries with attempts in
+        // flight are kept, since their reservations still refer to them.
         if now.duration_since(state.last_prune) >= window {
             state
                 .entries
-                .retain(|_, e| now.duration_since(e.window_start) < window);
+                .retain(|_, e| e.pending > 0 || now.duration_since(e.window_start) < window);
             state.last_prune = now;
         }
 
         let key = state.key(ip);
         let entry = state.entries.entry(key).or_insert(FailureEntry {
             failures: 0,
+            pending: 0,
             window_start: now,
         });
-        if now.duration_since(entry.window_start) >= window {
+        let elapsed = now.duration_since(entry.window_start);
+        if elapsed >= window {
             entry.failures = 0;
             entry.window_start = now;
+        } else if entry.failures >= self.max_failures {
+            return Err(window - elapsed);
         }
-        entry.failures = entry.failures.saturating_add(1);
+        if entry.failures.saturating_add(entry.pending) >= self.max_failures {
+            // Budget held by attempts in flight, which resolve shortly.
+            return Err(Duration::from_secs(1));
+        }
+        entry.pending += 1;
+        Ok(Reservation {
+            limiter: self,
+            key,
+            done: false,
+        })
     }
 
     fn lock(&self) -> MutexGuard<'_, FailureState> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Attempt reserved by [`FailureLimiter::reserve`].
+pub(crate) struct Reservation<'a> {
+    limiter: &'a FailureLimiter,
+    key: Key,
+    done: bool,
+}
+
+impl Reservation<'_> {
+    /// Record the attempt as a failure.
+    pub(crate) fn fail(mut self) {
+        self.finish(true);
+    }
+
+    fn finish(&mut self, failed: bool) {
+        self.done = true;
+        let now = Instant::now();
+        let mut state = self.limiter.lock();
+        let Some(entry) = state.entries.get_mut(&self.key) else {
+            return;
+        };
+        entry.pending = entry.pending.saturating_sub(1);
+        if failed {
+            if now.duration_since(entry.window_start) >= self.limiter.window {
+                entry.failures = 0;
+                entry.window_start = now;
+            }
+            entry.failures = entry.failures.saturating_add(1);
+        } else if entry.failures == 0 && entry.pending == 0 {
+            // Only failures need tracking.
+            state.entries.remove(&self.key);
+        }
+    }
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            self.finish(false);
+        }
     }
 }
 
@@ -410,38 +463,66 @@ mod tests {
         Some(s.parse().unwrap())
     }
 
+    fn fail(limiter: &FailureLimiter, ip: Option<IpAddr>) {
+        limiter.reserve(ip).unwrap().fail();
+    }
+
     #[test]
     fn failure_limiter_blocks_after_budget() {
         let limiter = FailureLimiter::new(2, Duration::from_secs(60));
-        assert!(limiter.blocked_for(ip("1.2.3.4")).is_none());
-        limiter.record_failure(ip("1.2.3.4"));
-        assert!(limiter.blocked_for(ip("1.2.3.4")).is_none());
-        limiter.record_failure(ip("1.2.3.4"));
-        let left = limiter.blocked_for(ip("1.2.3.4")).unwrap();
+        fail(&limiter, ip("1.2.3.4"));
+        drop(limiter.reserve(ip("1.2.3.4")).unwrap());
+        fail(&limiter, ip("1.2.3.4"));
+        let left = limiter.reserve(ip("1.2.3.4")).err().unwrap();
         assert!(left > Duration::from_secs(59) && left <= Duration::from_secs(60));
-        assert!(limiter.blocked_for(ip("5.6.7.8")).is_none());
-        assert!(limiter.blocked_for(None).is_none());
+        assert!(limiter.reserve(ip("5.6.7.8")).is_ok());
+        assert!(limiter.reserve(None).is_ok());
+    }
+
+    #[test]
+    fn in_flight_attempts_count_against_budget() {
+        let limiter = FailureLimiter::new(2, Duration::from_secs(60));
+        let a = limiter.reserve(ip("1.2.3.4")).unwrap();
+        let b = limiter.reserve(ip("1.2.3.4")).unwrap();
+        assert_eq!(
+            limiter.reserve(ip("1.2.3.4")).err(),
+            Some(Duration::from_secs(1))
+        );
+        // Released (success or cancellation) frees the slot...
+        drop(a);
+        let c = limiter.reserve(ip("1.2.3.4")).unwrap();
+        // ...while failures keep it.
+        b.fail();
+        c.fail();
+        assert!(limiter.reserve(ip("1.2.3.4")).err().unwrap() > Duration::from_secs(1));
+    }
+
+    #[test]
+    fn successes_leave_no_entry() {
+        let limiter = FailureLimiter::new(2, Duration::from_secs(60));
+        drop(limiter.reserve(ip("1.2.3.4")).unwrap());
+        assert!(limiter.lock().entries.is_empty());
     }
 
     #[test]
     fn failure_limiter_window_resets() {
         let limiter = FailureLimiter::new(1, Duration::from_millis(10));
-        limiter.record_failure(ip("1.2.3.4"));
-        assert!(limiter.blocked_for(ip("1.2.3.4")).is_some());
+        fail(&limiter, ip("1.2.3.4"));
+        assert!(limiter.reserve(ip("1.2.3.4")).is_err());
         std::thread::sleep(Duration::from_millis(20));
-        assert!(limiter.blocked_for(ip("1.2.3.4")).is_none());
-        limiter.record_failure(ip("5.6.7.8"));
+        fail(&limiter, ip("5.6.7.8"));
         assert_eq!(limiter.lock().entries.len(), 1, "stale entry pruned");
+        assert!(limiter.reserve(ip("1.2.3.4")).is_ok());
     }
 
     #[test]
     fn ipv6_grouped_by_prefix() {
         let limiter = FailureLimiter::new(1, Duration::from_secs(60));
-        limiter.record_failure(ip("2001:db8::1"));
-        assert!(limiter.blocked_for(ip("2001:db8::ffff")).is_some());
-        assert!(limiter.blocked_for(ip("2001:db8:0:1::1")).is_none());
-        limiter.record_failure(ip("::ffff:9.9.9.9"));
-        assert!(limiter.blocked_for(ip("9.9.9.9")).is_some());
+        fail(&limiter, ip("2001:db8::1"));
+        assert!(limiter.reserve(ip("2001:db8::ffff")).is_err());
+        assert!(limiter.reserve(ip("2001:db8:0:1::1")).is_ok());
+        fail(&limiter, ip("::ffff:9.9.9.9"));
+        assert!(limiter.reserve(ip("9.9.9.9")).is_err());
     }
 
     #[test]
@@ -496,7 +577,8 @@ mod tests {
             let now = Instant::now();
             for i in 0..MAX_ENTRIES as u32 {
                 let entry = FailureEntry {
-                    failures: 0,
+                    failures: 1,
+                    pending: 0,
                     window_start: now,
                 };
                 state
@@ -505,11 +587,12 @@ mod tests {
             }
         }
         // Rotating addresses all land in the overflow entry...
-        limiter.record_failure(ip("200.0.0.1"));
-        assert!(limiter.blocked_for(ip("200.0.0.2")).is_some());
-        assert!(limiter.blocked_for(None).is_some());
+        fail(&limiter, ip("200.0.0.1"));
+        assert!(limiter.reserve(ip("200.0.0.2")).is_err());
+        assert!(limiter.reserve(None).is_err());
         // ...while tracked clients keep their own entry.
-        assert!(limiter.blocked_for(ip("0.0.0.1")).is_none());
+        assert!(limiter.reserve(ip("0.0.0.1")).is_err());
+        assert!(limiter.lock().entries.contains_key(&ip("0.0.0.1")));
         assert_eq!(limiter.lock().entries.len(), MAX_ENTRIES + 1);
     }
 }
